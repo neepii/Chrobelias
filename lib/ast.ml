@@ -502,6 +502,7 @@ let lor_ = function
 
 let eia eia = Eia eia
 let pred s = Pred s
+let divides b a = Eia (Eia.Eq (Eia.Mod (a, b), Eia.Const Z.zero, I))
 
 let rec lnot = function
   | Lnot ast -> ast
