@@ -3513,6 +3513,17 @@ let%expect_test _ =
   ();
   [%expect
     {|
+    Found something
+    Coeff: 1
+    Term without selected variable: (+ (- 1) (* 2 x))
+    Found something
+    Coeff: 2
+    Term without selected variable:
+    (+ (- 3) x z)
+    Found something
+    Coeff: 1
+    Term without selected variable:
+    (+ (- 3) (* 2 z))
     |}]
 ;;
 
@@ -3596,8 +3607,9 @@ let%expect_test _ =
     {|
     (= (+ (* y 5) (* (* 2 x) 5)) 5)
     (= (+ (* x 5) (* z 5) (* (* 2 y) 5)) 15)
+
     (= (+ (* y 5) (* (* 2 z) 5)) 15)
-   |}]
+    |}]
 ;;
 
 let eliminate_one_var conj varname subst =
@@ -3688,7 +3700,20 @@ let%expect_test _ =
       ]
   in
   let _ = test ph in
-  ()
+  ();
+  [%expect {|
+    (= (mod (+ (- 1) y) 2) 0)
+    True
+    (= (+ (* 2 z) (* 3 y)) 5)
+    (= (+ (* 2 y)
+                                                                (* 4 z)) 6)
+
+    (= (mod (+ (- 3) z (* 2 y)) 1) 0)
+    (= (+ y (* 2 x)) 1)
+    (= (+ x z (* 2 y)) 3)
+
+    (= (+ y (* 2 z)) 3)
+    |}]
 ;;
 
 let subst_eia subst =
@@ -3787,10 +3812,12 @@ let%expect_test _ =
             ; add [ var "x"; mul [ const 2; var "y" ] ] = const 2
             ] ))
   in
-  test ph
-[@@expect.uncaught_exn
-  {|
-  |}]
+  test ph;
+  [%expect {|
+    (((= (mod (+ (- 2) x) 2) 0) & True & (= (* 3 x) 0)) | ((= (mod (+ (- 1)
+                                                                   (* 2 x)) 1) 0) &
+    (= x 2) & (= (* 2 x) 1)))
+    |}]
 ;;
 
 (* let%expect_test _ = *)
