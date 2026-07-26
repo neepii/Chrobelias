@@ -3670,17 +3670,6 @@ let eliminate_one_var conj varname subst =
         | _ -> assert false)
       |> fun x -> divides coeff tau :: x |> List.map (apply_symantics (module TS))
     in
-    (* let conj = *)
-    (*   List.map *)
-    (*     (fun c -> *)
-    (*        match c with *)
-    (*        | Ast.Eia (Eq (l, r, I)) -> *)
-    (*          Ast.eia (Eq (subst_term subst l, subst_term subst r, I)) *)
-    (*        | Ast.Eia (Leq (l, r)) -> *)
-    (*          Ast.eia (Leq (subst_term subst l, subst_term subst r)) *)
-    (*        | other -> other) *)
-    (*     conj *)
-    (* in *)
     return (conj, subst)
 ;;
 
@@ -3701,7 +3690,8 @@ let%expect_test _ =
   in
   let _ = test ph in
   ();
-  [%expect {|
+  [%expect
+    {|
     (= (mod (+ (- 1) y) 2) 0)
     True
     (= (+ (* 2 z) (* 3 y)) 5)
@@ -3813,11 +3803,98 @@ let%expect_test _ =
             ] ))
   in
   test ph;
-  [%expect {|
+  [%expect
+    {|
     (((= (mod (+ (- 2) x) 2) 0) & True & (= (* 3 x) 0)) | ((= (mod (+ (- 1)
                                                                    (* 2 x)) 1) 0) &
     (= x 2) & (= (* 2 x) 1)))
     |}]
+;;
+
+let is_linear_system =
+  let open Ast.Eia in
+  let rec helper = function
+    | Const _ -> true
+    | Atom _ -> true
+    | Add xs -> List.for_all helper xs
+    | Mul xs -> List.for_all helper xs
+    | Mod (xs, _) -> helper xs
+    | _ -> false
+  in
+  let rec aux = function
+    | Ast.Land conj -> List.for_all aux conj
+    | Ast.Eia (Leq (l, r)) -> helper l && helper r
+    | Ast.Eia (Eq (l, r, I)) -> helper l && helper r
+    | _ -> false
+  in
+  function
+  | Ast.Land conj -> List.for_all aux conj
+  | _ -> false
+;;
+
+let is_linear_constraint =
+  let open Ast.Eia in
+  let rec helper = function
+    | Const _ -> true
+    | Atom _ -> true
+    | Add xs -> List.for_all helper xs
+    | Mul xs -> List.for_all helper xs
+    | Mod (xs, _) -> helper xs
+    | _ -> false
+  in
+  function
+  | Ast.Eia (Leq (l, r)) -> helper l && helper r
+  | Ast.Eia (Eq (l, r, I)) -> helper l && helper r
+  | _ -> false
+;;
+
+let%expect_test _ =
+  let (module TS) = make_main_symantics Env.empty in
+  let test ph = is_linear_system ph |> Format.printf "%b\n" in
+  let ph1 = TS.(Ast.Land [ add [ mul [ const 2; var "x" ]; var "y" ] = const 1 ]) in
+  let ph2 = TS.(Ast.Land [ add [ var "x"; mul [ const 2; var "y" ] ] = const 2 ]) in
+  let ph3 = Ast.Land [ ph1; ph2 ] in
+  test ph1;
+  test ph2;
+  test ph3
+;;
+
+let simplify_quantifiers (ast : Ast.t) =
+  let open Ast in
+  let rec aux = function
+    | True -> True
+    | Ast.Exists (_, ast) as eq when is_linear_system ast ->
+      eliminate_existence_quantifier eq
+    | Ast.Exists (atoms, ast) when is_linear_constraint ast ->
+      eliminate_existence_quantifier (Ast.Exists (atoms, Ast.Land [ ast ]))
+    | Ast.Exists (atoms, ast) -> Ast.Exists (atoms, aux ast)
+    | Ast.Lnot ast -> aux ast
+    | Ast.Land ast -> land_ (List.map aux ast)
+    | Ast.Lor ast -> lor_ (List.map aux ast)
+    | ast -> ast
+  in
+  aux ast
+;;
+
+let%expect_test _ =
+  let (module TS) = make_main_symantics Env.empty in
+  let test ph = simplify_quantifiers ph |> Format.printf "%a\n" Ast.pp in
+  let ph1 =
+    TS.(
+      exists
+        [ Ast.Any_atom (Ast.Var ("y", I)) ]
+        (Ast.Land [ add [ mul [ const 2; var "x" ]; var "y" ] = const 1 ]))
+  in
+  let ph2 =
+    TS.(
+      exists
+        [ Ast.Any_atom (Ast.Var ("y", I)) ]
+        (land_ [ add [ mul [ const 2; var "x" ]; var "y" ] = const 1 ]))
+  in
+  let ph3 = TS.(land_ [ ph1; ph2 ]) in
+  test ph1;
+  test ph2;
+  test ph3
 ;;
 
 (* let%expect_test _ = *)
