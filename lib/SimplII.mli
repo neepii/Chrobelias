@@ -45,6 +45,7 @@ val run_basic_simplify
 val run_under2 : Env.t -> Ast.t -> [ `Sat | `Underapprox of Ast.t list ]
 val check_nia : Env.t -> Ast.t -> [> `Sat of Env.t | `Unknown | `Unsat ]
 val pp_error : Format.formatter -> error -> unit
+val simplify_quantifiers : Ast.t -> Ast.t
 
 (* val rewrite_len : Ast.t -> Ast.t *)
 

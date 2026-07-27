@@ -3667,7 +3667,7 @@ let eliminate_one_var conj varname subst =
               TS.(add [ l; mul [ const (-1); r ] ])
           in
           TS.(Eia (Leq (term, const 0)))
-        | _ -> assert false)
+        | x -> x)
       |> fun x -> divides coeff tau :: x |> List.map (apply_symantics (module TS))
     in
     return (conj, subst)
@@ -3811,20 +3811,22 @@ let%expect_test _ =
     |}]
 ;;
 
-let is_linear_system =
+let rec is_linear_term =
   let open Ast.Eia in
-  let rec helper = function
-    | Const _ -> true
-    | Atom _ -> true
-    | Add xs -> List.for_all helper xs
-    | Mul xs -> List.for_all helper xs
-    | Mod (xs, _) -> helper xs
-    | _ -> false
-  in
+  function
+  | Const _ -> true
+  | Atom _ -> true
+  | Add xs -> List.for_all is_linear_term xs
+  | Mul xs -> List.for_all is_linear_term xs
+  | Mod (xs, _) -> is_linear_term xs
+  | _ -> false
+;;
+
+let is_linear_system =
   let rec aux = function
     | Ast.Land conj -> List.for_all aux conj
-    | Ast.Eia (Leq (l, r)) -> helper l && helper r
-    | Ast.Eia (Eq (l, r, I)) -> helper l && helper r
+    | Ast.Eia (Ast.Eia.Leq (l, r)) -> is_linear_term l && is_linear_term r
+    | Ast.Eia (Ast.Eia.Eq (l, r, I)) -> is_linear_term l && is_linear_term r
     | _ -> false
   in
   function
@@ -3832,31 +3834,10 @@ let is_linear_system =
   | _ -> false
 ;;
 
-let is_linear_constraint =
-  let open Ast.Eia in
-  let rec helper = function
-    | Const _ -> true
-    | Atom _ -> true
-    | Add xs -> List.for_all helper xs
-    | Mul xs -> List.for_all helper xs
-    | Mod (xs, _) -> helper xs
-    | _ -> false
-  in
-  function
-  | Ast.Eia (Leq (l, r)) -> helper l && helper r
-  | Ast.Eia (Eq (l, r, I)) -> helper l && helper r
+let is_linear_constraint = function
+  | Ast.Eia (Ast.Eia.Leq (l, r)) -> is_linear_term l && is_linear_term r
+  | Ast.Eia (Ast.Eia.Eq (l, r, I)) -> is_linear_term l && is_linear_term r
   | _ -> false
-;;
-
-let%expect_test _ =
-  let (module TS) = make_main_symantics Env.empty in
-  let test ph = is_linear_system ph |> Format.printf "%b\n" in
-  let ph1 = TS.(Ast.Land [ add [ mul [ const 2; var "x" ]; var "y" ] = const 1 ]) in
-  let ph2 = TS.(Ast.Land [ add [ var "x"; mul [ const 2; var "y" ] ] = const 2 ]) in
-  let ph3 = Ast.Land [ ph1; ph2 ] in
-  test ph1;
-  test ph2;
-  test ph3
 ;;
 
 let simplify_quantifiers (ast : Ast.t) =
@@ -3866,9 +3847,9 @@ let simplify_quantifiers (ast : Ast.t) =
     | Ast.Exists (_, ast) as eq when is_linear_system ast ->
       eliminate_existence_quantifier eq
     | Ast.Exists (atoms, ast) when is_linear_constraint ast ->
-      eliminate_existence_quantifier (Ast.Exists (atoms, Ast.Land [ ast ]))
-    | Ast.Exists (atoms, ast) -> Ast.Exists (atoms, aux ast)
-    | Ast.Lnot ast -> aux ast
+      eliminate_existence_quantifier (exists atoms (Ast.Land [ ast ]))
+    | Ast.Exists (atoms, ast) -> exists atoms (aux ast)
+    | Ast.Lnot ast -> lnot (aux ast)
     | Ast.Land ast -> land_ (List.map aux ast)
     | Ast.Lor ast -> lor_ (List.map aux ast)
     | ast -> ast
@@ -3892,9 +3873,20 @@ let%expect_test _ =
         (land_ [ add [ mul [ const 2; var "x" ]; var "y" ] = const 1 ]))
   in
   let ph3 = TS.(land_ [ ph1; ph2 ]) in
+  let ph4 =
+    TS.(
+      exists
+        [ Ast.Any_atom (Ast.Var ("x0", I)); Ast.Any_atom (Ast.Var ("x1", I)) ]
+        (lor_
+           [ not (land_ [ var "x0" <= const 0; const 0 <= var "x1" ])
+           ; not
+               (add [ mul [ var "x0"; const 199 ]; mul [ var "x1"; const 221 ] ] = var "P")
+           ]))
+  in
   test ph1;
   test ph2;
-  test ph3
+  test ph3;
+  test ph4
 ;;
 
 (* let%expect_test _ = *)

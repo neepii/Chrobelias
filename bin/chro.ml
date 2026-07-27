@@ -282,6 +282,7 @@ let print_model model = Format.printf "%s\n%!" (Lib.Ir.model_to_str model)
 let rec check_sat ?(verbose = false) tys ast : rez =
   if config.logic = `Eia && Lib.Ast.is_str ast
   then config.logic <- (if Lib.Config.config.no_str_bv then `Str else `StrBv);
+  let ast = Lib.SimplII.simplify_quantifiers ast in
   let __ () =
     if config.stop_after = `Pre_simplify
     then (
