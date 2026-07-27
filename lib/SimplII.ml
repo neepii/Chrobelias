@@ -3886,7 +3886,19 @@ let%expect_test _ =
   test ph1;
   test ph2;
   test ph3;
-  test ph4
+  test ph4;
+  [%expect {|
+    ((= (mod (+ (- 1) (* 2 x)) 1) 0) & (= (* 2 x) 1))
+    ((= (mod (+ (- 1) (* 2 x)) 1) 0) &
+    (= (* 2 x) 1))
+    ((= (mod (+ (- 1) (* 2 x)) 1) 0) & (= (* 2 x) 1) & (= (mod
+                                                                      (+ (- 1)
+                                                                      (* 2 x)) 1) 0) &
+    (= (* 2 x) 1))
+    (Ex0 x1 ((<= (+ x1 1) 0) | (<= (+ 0 1) x0) | (distinct
+                                                                (+ (* 199 x0)
+                                                                (* 221 x1)) P)))
+    |}]
 ;;
 
 (* let%expect_test _ = *)
