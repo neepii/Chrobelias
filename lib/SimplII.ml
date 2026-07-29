@@ -3904,7 +3904,7 @@ let%expect_test _ =
 
   in
 
-  let rec check = function
+  let rec check_right_form = function
     | Ast.True -> true
     | Ast.Eia eia -> 
       begin match eia with 
@@ -3912,22 +3912,38 @@ let%expect_test _ =
       | Ast.Eia.Leq (_, _) -> true
       | _ -> false
       end
-    | Ast.Land terms | Ast.Lor terms -> List.for_all check terms
+    | Ast.Land terms | Ast.Lor terms -> List.for_all check_right_form terms
     | Ast.Exists (vars, body) -> 
-        (match vars with [] -> true | _ -> false) && check body
+        (match vars with [] -> true | _ -> false) && check_right_form body
     | _ -> false
 
   in 
 
+  let sat_results_equal ph set =
+    let ir_ph = Me.ir_of_ast Env.empty ph in
+    let ir_set = Me.ir_of_ast Env.empty set in
+    match ir_ph, ir_set with
+    | Ok ir_ph, Ok ir_set ->
+      let res_ph = Solver.check_sat ir_ph in
+      let res_set = Solver.check_sat ir_set in
+      (match res_ph, res_set with
+        | `Sat _, `Sat _ -> true
+        | `Unsat, `Unsat -> true
+        | `Unknown _, `Unknown _ -> true
+        | _ -> false)
+    | _ -> false
+
+  in
+
   let test = 
     QCheck.Test.make 
-      ~name:"Correct form of system"
+      ~name:"Property tests for GaussQE"
       ~count:1
       (QCheck.make ~print:(fun set -> Format.asprintf "%a" Ast.pp set) gen_system)
       (fun ph ->
         let (module TS) = make_main_symantics Env.empty in
         let set = eliminate_existence_quantifier ph in
-        check set
+        (check_right_form set) && (sat_results_equal set ph)
       )
     in
     let _success = QCheck_runner.run_tests ~verbose:true [test] in
