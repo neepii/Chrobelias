@@ -1,0 +1,76 @@
+\documentclass{beamer}
+\usetheme{Boadilla}
+\usepackage{graphicx}
+\usepackage[utf8]{inputenc}        
+\usepackage[T2A]{fontenc}          
+\usepackage[english,russian]{babel}
+
+
+\title[GaussQE]{Оптимизация ChrobELIAS с помощью GaussQE}
+\author[Самодуров Н., Стариков Е.]{Самодуров Никита, Стариков Егор}
+\institute[]{
+  Научный руководитель: Белянин Георгий \\
+  СПбГУ
+}
+\date{29.07.2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{frame}{Введение}
+    \begin{itemize}
+      \item ChrobELIAS — это специализированный SMT-решатель (Satisfiability Modulo Theories), предназначенный для проверки выполнимости логических формул в рамках экспоненциально-линейной целочисленной арифметики с регулярными ограничениями. 
+      \item GaussQE — алгоритм элиминации кванторов существования.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Акутальность}
+    \begin{itemize}
+        \item SMT-решатели применяются в таких сферах, как: 
+        \begin{itemize}
+            \item Верификация ПО и аппаратного обеспечения
+            \item Автоматическое тестирование и поиск уязвимостей
+            \item Решение задач планировани
+        \end{itemize}
+        \item Уникальность ChrobELIAS:
+        \begin{itemize}
+            \item Поддерживает экспоненциально-линейную целочисленную арифметику
+            \item Поддерживает регулярные ограничения на строки
+        \end{itemize}
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Цель и задачи}
+    \begin{itemize}
+      \item \textbf{Цель:} оптимизация ChrobELIAS путем дополнительной обработки формул с помощью GaussQE.
+      \item \textbf{Задачи:}
+      \begin{itemize}
+        \item Реализация алгоритма GaussQE
+        \item Добавление симплификации в ChrobELIAS
+        \item Сравнительный анализ производительности
+      \end{itemize}
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{GaussQE}
+    \begin{itemize}
+        \item Метод элиминации Гаусса-Жордана для целочисленного программирования — это алгоритм, принимающий систему линейных уравнений/неравенств вида $\exists x \, \phi$, который с помощью введения slack-переменных и недетерменированных подстановок переменных избавляется от переменных, стоящих под квантором существования.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Сравнение}
+    
+\end{frame}
+
+\begin{frame}{Список литературы}
+    \begin{thebibliography}{99}
+    
+    \bibitem{chistikov2024}
+    D. Chistikov, A. Mansutti, M.~R. Starchak.
+    \newblock Integer Linear-Exponential Programming in NP by Quantifier Elimination.
+    \newblock \emph{arXiv:2407.07083}, 2024.
+    \end{thebibliography}
+\end{frame}
+
+\end{document}
