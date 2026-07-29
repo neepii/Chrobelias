@@ -3811,6 +3811,146 @@ let%expect_test _ =
     |}]
 ;;
 
+let%expect_test _ = 
+  let rec take num lst =
+    if num = 0 then []
+    else match lst with 
+      | [] -> []
+      | h :: l -> h :: take (num - 1) l
+
+  in
+
+  let split_at lst n =
+    let _, left, right = 
+      List.fold_left 
+        (fun (i, left, right) x -> 
+          if i > 0 then (i - 1, x :: left, right)   
+          else (0, left, x :: right))              
+        (n, [], []) 
+        lst
+    in 
+    (List.rev left, List.rev right)
+
+  in 
+
+  let gen_var_name =  
+    let open QCheck.Gen in
+    string_size ~gen:(char_range 'a' 'z') (int_range 1 5)
+
+  in
+
+  let gen_mul_term var =
+    let open QCheck.Gen in
+    let open Ast.Eia in
+    let* coeff = int_range (-1000) 1000 in
+    return (Mul [
+      Const (Z.of_int coeff);
+      Atom (Var (var, Ast.I))
+    ])
+
+  in
+
+  let gen_inequality left_vars right_vars =
+    let open QCheck.Gen in
+    let open Ast.Eia in
+    let rec gen_terms vars =
+      match vars with
+      | [] -> return []
+      | v :: vs ->
+          let* term = gen_mul_term v in
+          let* rest = gen_terms vs in
+          return (term :: rest)
+    in
+    let* left_mul_terms = gen_terms left_vars in
+    let* right_mul_terms = gen_terms right_vars in
+    return (Leq (Add left_mul_terms, Add right_mul_terms))
+
+  in
+
+  let gen_inequalities var_names = 
+    let open QCheck.Gen in
+    let* count = int_range 2 3 in
+    let rec loop n acc =
+      if n = 0 then return acc
+      else
+        let* shuffled = shuffle_list var_names in
+        let* split_point = int_range 1 (List.length var_names - 1) in
+        let left_vars, right_vars = split_at shuffled split_point in
+        let* inequality = gen_inequality left_vars right_vars in
+        loop (n - 1) (inequality :: acc)
+    in
+    loop count []
+
+  in
+
+  let gen_exists_vars var_names = 
+    let open QCheck.Gen in
+    let* count = int_range 1 (List.length var_names - 1) in
+    let* shuffled = shuffle_list var_names in
+    let selected = take count shuffled in
+    return (List.map (fun name -> Ast.Any_atom (Ast.Var (name, I))) selected)
+
+  in
+
+  let gen_system = 
+    let (module TS) = make_main_symantics Env.empty in
+    let open QCheck.Gen in
+    let* var_names = list_size (int_range 2 3) gen_var_name in
+    let* inequalities_raw = gen_inequalities var_names in  
+    let inequalities = List.map (fun eia -> Ast.Eia eia) inequalities_raw in
+    let* exists_vars = gen_exists_vars var_names in 
+    let ph = TS. (Ast.Exists (exists_vars, land_ inequalities)) in
+    return ph
+
+  in
+
+  let rec check_right_form = function
+    | Ast.True -> true
+    | Ast.Eia eia -> 
+      begin match eia with 
+      | Ast.Eia.Eq (_, _, _) -> true 
+      | Ast.Eia.Leq (_, _) -> true
+      | _ -> false
+      end
+    | Ast.Land terms | Ast.Lor terms -> List.for_all check_right_form terms
+    | Ast.Exists (vars, body) -> 
+        (match vars with [] -> true | _ -> false) && check_right_form body
+    | _ -> false
+
+  in 
+
+  let sat_results_equal ph set =
+    let ir_ph = Me.ir_of_ast Env.empty ph in
+    let ir_set = Me.ir_of_ast Env.empty set in
+    match ir_ph, ir_set with
+    | Ok ir_ph, Ok ir_set ->
+      let res_ph = Solver.check_sat ir_ph in
+      let res_set = Solver.check_sat ir_set in
+      (match res_ph, res_set with
+        | `Sat _, `Sat _ -> true
+        | `Unsat, `Unsat -> true
+        | `Unknown _, `Unknown _ -> true
+        | _ -> false)
+    | _ -> false
+
+  in
+
+  let test = 
+    QCheck.Test.make 
+      ~name:"Property tests for GaussQE"
+      ~count:1
+      (QCheck.make ~print:(fun set -> Format.asprintf "%a" Ast.pp set) gen_system)
+      (fun ph ->
+        let (module TS) = make_main_symantics Env.empty in
+        let set = eliminate_existence_quantifier ph in
+        (check_right_form set) && (sat_results_equal set ph)
+      )
+    in
+    let _success = QCheck_runner.run_tests ~verbose:true [test] in
+    [%expect{|
+    
+      |}]
+
 let rec is_linear_term =
   let open Ast.Eia in
   function
