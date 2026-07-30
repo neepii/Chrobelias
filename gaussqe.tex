@@ -1,0 +1,103 @@
+\documentclass{beamer}
+\usetheme{Boadilla}
+\usepackage{graphicx}
+\usepackage[utf8]{inputenc}        
+\usepackage[T2A]{fontenc}
+\usepackage[english,russian]{babel}
+\usepackage{xspace}
+\newcommand{\chro}{\textsc{ChrobELIAS}\xspace}
+\newcommand{\gaussqe}{\textsc{GaussQE}\xspace}
+
+\title[GaussQE]{Оптимизация ChrobELIAS с помощью GaussQE}
+\author[Самодуров Н., Стариков Е.]{Самодуров Никита, Стариков Егор}
+\institute[]{
+  Научный руководитель: Белянин Георгий \\
+  СПбГУ
+}
+\date{29.07.2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{frame}{Введение}
+    \begin{itemize}
+      \item \chro ~--- это специализированный SMT-решатель (Satisfiability Modulo Theories), предназначенный для проверки выполнимости логических формул в рамках экспоненциально-линейной целочисленной арифметики с регулярными ограничениями $\langle \mathbb{N}, 0, 1, +, x \mapsto 2^x, R, =, \leq \rangle$.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Акутальность}
+    \begin{itemize}
+        \item SMT-решатели применяются в таких сферах, как: 
+        \begin{itemize}
+            \item Верификация ПО и аппаратного обеспечения
+            \item Автоматическое тестирование и поиск уязвимостей
+            \item Решение задач планирования
+        \end{itemize}
+        \item Уникальность \chro:
+        \begin{itemize}
+            \item Поддерживает экспоненциально-линейную целочисленную арифметику
+            \item Поддерживает регулярные ограничения на строки
+            \item Использует конечные автоматы
+            \[
+            \begin{cases}
+            2^x + 2^y = 12 \\
+            2x + y = 25
+            \end{cases}
+            \]
+            \[
+            \begin{cases}
+            2x + y = 1 \\
+            x + 2y = 2
+            \end{cases}
+            \]
+        \end{itemize}
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Цель и задачи}
+    \begin{itemize}
+      \item \textbf{Цель:} оптимизация \chro путем дополнительной обработки формул с помощью \gaussqe \cite{chistikov2024}.
+      \item \textbf{Задачи:}
+      \begin{itemize}
+        \item Реализовать алгоритм \gaussqe
+        \item Добавить симплификации в \chro
+        \item Сравнить производительность
+      \end{itemize}
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{GaussQE}
+    \begin{itemize}
+        \item В основе алгоритма лежит метод Гаусса-Жордана, адаптированный для целочисленных задач
+    \end{itemize}
+    \vspace{1cm}  
+    \centering
+    $
+    \begin{array}{rcl}
+    \exists y \; (2x + y = 1 \land x + 2y = 2) & \Longleftrightarrow & \\
+    \bigl( (x - 2) \equiv 0 \pmod{2} \land 3x = 0 \bigr) & \lor & \\
+    \bigl( (2x - 1) \equiv 0 \pmod{1} \land x = 2 \land 2x = 1 \bigr) & &
+    \end{array}
+    $
+\end{frame}
+
+\begin{frame}{Сравнение}
+    
+\end{frame}
+
+\begin{frame}{Вывод}
+    
+\end{frame}
+
+\begin{frame}{Список литературы}
+    \begin{thebibliography}{99}
+    
+    \bibitem{chistikov2024}
+    D. Chistikov, A. Mansutti, M.~R. Starchak.
+    \newblock Integer Linear-Exponential Programming in NP by Quantifier Elimination.
+    \newblock \emph{arXiv:2407.07083}, 2024.
+    \end{thebibliography}
+\end{frame}
+
+\end{document}
