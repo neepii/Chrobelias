@@ -91,7 +91,7 @@ quantifier, not an existential one).
   > (check-sat)
   > EOF
   $ Chro --dpresimpl --stop-after presimpl pow.smt2
-  (exists (x) (= (+ y (* (- 2) (exp 2 x))) 0))
+  (exists (x) (= (+ y (* (- 2) (** 2 x))) 0))
 
 A negated binder still gets the usual lowering of the whole `mod`, so the
 answers stay the same as without the rewrite: y = 4 is even, y = 5 is not.
@@ -126,14 +126,15 @@ be reduced on the way out. Here x = 2, y = 4 and 2^4 = 16 = 6 + 10.
   > (set-logic ALL)
   > (declare-fun x () Int)
   > (declare-fun y () Int)
-  > (assert (= (exp 2 x) y))
-  > (assert (exists ((k Int)) (= (+ 6 (* 10 k)) (exp 2 y))))
+  > (assert (= (** 2 x) y))
+  > (assert (exists ((k Int)) (= (+ 6 (* 10 k)) (** 2 y))))
   > (check-sat)
   > EOF
   $ Chro --dpresimpl --stop-after presimpl exp.smt2
   (and
-    (= (+ (* (- 1) y) (exp 2 x)) 0)
-    (exists (k) (= (+ 6 (* 10 k) (* (- 1) (exp 2 y))) 0)))
+    (= (+ y (* (- 1) (** 2 x))) 0)
+    (<= (* (- 1) x) 0)
+    (exists (k) (= (+ 6 (* 10 k) (* (- 1) (** 2 y))) 0)))
   $ Chro --info -bound -1 exp.smt2
   sat (nfa)
 
@@ -154,8 +155,8 @@ quotient track.
   > EOF
   $ Chro --dpresimpl --stop-after presimpl nested.smt2
   (and
-    (= (mod %r1 6) 0)
-    (= (mod (+ (* (- 1) %r1) x) 109) 0)
+    (divides 6 %r1)
+    (divides 109 (+ (* (- 1) %r1) x))
     (<= (+ (- 108) %r1) 0)
     (<= (* (- 1) %r1) 0)
     (<= (* (- 1) x) 0))

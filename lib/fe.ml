@@ -174,10 +174,51 @@ and to_eia_term orig_expr : Z.t Ast.Eia.term * Ast.t =
   | Expr.App ({ name = Symbol.Simple "pow10"; _ }, [ expr ]) ->
     let* expr, phs = to_eia_term expr in
     return (Ast.Eia.pow Ast.Eia.(const (Z.of_int 10)) expr) phs
-  | Expr.App ({ name = Symbol.Simple "exp"; _ }, [ base; exp ]) ->
+  (* Exponentiation as standardized in SMT-LIB Ints (April 2026). "exp" is
+     the pre-standard spelling; kept as an alias while the vendored
+     benchmark corpora still use it (Chrobelias/Chrobelias#257).
+
+     Constant-constant powers with a negative exponent fold right here by
+     the standard's rules; everything else the engine's partial relation
+     does not cover is totalized by [SimplII.std_exp_split] before
+     solving. *)
+  | Expr.App ({ name = Symbol.Simple ("**" | "exp"); _ }, [ base; exp ]) ->
     let* base, phs = to_eia_term base in
     let* exp, phs' = to_eia_term exp in
-    return (Ast.Eia.pow base exp) (phs @ phs')
+    let rec const_of : Z.t Ast.Eia.term -> Z.t option = function
+      | Ast.Eia.Const c -> Some c
+      | Ast.Eia.Mul ts ->
+        List.fold_left
+          (fun acc t ->
+             match acc, const_of t with
+             | Some a, Some b -> Some (Z.mul a b)
+             | _ -> None)
+          (Some Z.one)
+          ts
+      | Ast.Eia.Add ts ->
+        List.fold_left
+          (fun acc t ->
+             match acc, const_of t with
+             | Some a, Some b -> Some (Z.add a b)
+             | _ -> None)
+          (Some Z.zero)
+          ts
+      | _ -> None
+    in
+    (* A constant negative exponent folds right here by the standard's
+       rules: [m ** n = div 1 (m ** -n)] for [n < 0], i.e. 0 whenever
+       [|m| > 1] or [m = 0], and [m ** -n] when [|m| = 1]. Nonnegative
+       constant exponents fold in the simplifier; every remaining shape
+       (negative or 0/1 bases over variable exponents, variable bases under
+       negative constant exponents) is totalized by [SimplII.std_exp_split]
+       before solving. *)
+      (match const_of base, const_of exp with
+       | Some m, Some k when Z.(lt k zero) ->
+         let v =
+           if Z.(equal (abs m) one) then if Z.is_even k then Z.one else m else Z.zero
+         in
+         return (Ast.Eia.const v) (phs @ phs')
+       | _ -> return (Ast.Eia.pow base exp) (phs @ phs'))
   (* Bit-wise operations *)
   | Expr.App ({ name = Symbol.Simple "bwand"; _ }, hd :: tl) ->
     List.fold_left

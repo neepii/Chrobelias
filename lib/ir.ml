@@ -88,6 +88,7 @@ type t =
   | SSuffixOf of atom * atom
   | SContains of atom * atom
   | SLen of atom * atom
+  | SLenConst of (atom * int) list
   | Stoi of atom * atom
   | Itos of atom * atom
   | Rel of rel * polynom * Z.t
@@ -106,6 +107,7 @@ let sprefixof a b = SPrefixOf (a, b)
 let ssuffixof a b = SSuffixOf (a, b)
 let scontains a b = SContains (a, b)
 let slen a b = SLen (a, b)
+let slen_const specs = SLenConst specs
 let stoi a b = Stoi (a, b)
 let itos a b = Itos (a, b)
 let rel a b c = Rel (a, b, c)
@@ -168,6 +170,13 @@ let rec pp fmt = function
   | SRegRaw (atom, re) -> Format.fprintf fmt "(str.in.re.raw %a)" pp_atom atom
   | SLen (atom, atom') ->
     Format.fprintf fmt "@[(chrob.len %a %a)@]" pp_atom atom pp_atom atom'
+  | SLenConst specs ->
+    Format.fprintf
+      fmt
+      "@[(chrob.len.const%a)@]"
+      (Format.pp_print_list (fun fmt (atom, n) ->
+         Format.fprintf fmt " %a=%d" pp_atom atom n))
+      specs
   | Stoi (atom, atom') ->
     Format.fprintf fmt "@[(= %a (chrob.to.int %a))@]" pp_atom atom pp_atom atom'
   | Itos (atom, atom') ->
@@ -261,7 +270,7 @@ let pp_smtlib2 ppf ir =
         rhs;
       (* Format.eprintf "\nexists = @[%a@]\n\n%!" pp_old e; *)
       fprintf ppf ")@]" *)
-    | ( SLen _ | Stoi _ | SReg _ | SRegRaw _
+    | ( SLen _ | SLenConst _ | Stoi _ | SReg _ | SRegRaw _
       | SPrefixOf (_, _)
       | SContains (_, _)
       | SSuffixOf (_, _)
@@ -368,6 +377,7 @@ let rec equal ir ir' =
     List.equal ( = ) atoms atoms' && equal ir ir'
   | SReg (atom, regex), SReg (atom', regex') -> atom = atom' && regex = regex'
   | SRegRaw (atom, regex), SRegRaw (atom', regex') -> atom = atom' && regex = regex'
+  | SLenConst specs, SLenConst specs' -> specs = specs'
   | SPrefixOf (atom, atom'), SPrefixOf (atom'', atom''')
   | SContains (atom, atom'), SContains (atom'', atom''')
   | SSuffixOf (atom, atom'), SSuffixOf (atom'', atom''')
@@ -385,6 +395,7 @@ let rec map2 f fleaf ir =
   | SReg (_, _) -> fleaf ir
   | SRegRaw (_, _) -> fleaf ir
   | SLen (_, _) -> fleaf ir
+  | SLenConst _ -> fleaf ir
   | Stoi (_, _) -> fleaf ir
   | Itos (_, _) -> fleaf ir
   | SPrefixOf (_, _) | SSuffixOf (_, _) | SContains (_, _) -> fleaf ir
@@ -405,6 +416,7 @@ let rec fold f acc ir =
   | SReg (_, _) -> f acc ir
   | SRegRaw (_, _) -> f acc ir
   | SLen (_, _) -> f acc ir
+  | SLenConst _ -> f acc ir
   | Stoi (_, _) -> f acc ir
   | Itos (_, _) -> f acc ir
   | SPrefixOf (_, _) | SContains (_, _) | SSuffixOf (_, _) -> f acc ir
@@ -482,6 +494,7 @@ let collect_vars ir =
        | Reg (_, atoms) -> Set.union acc (atoms |> List.map as_var |> Set.of_list)
        | SReg (atom, _) -> Set.add acc atom
        | SRegRaw (atom, _) -> Set.add acc atom
+       | SLenConst specs -> List.fold_left (fun acc (a, _) -> Set.add acc a) acc specs
        | SLen (atom, atom') -> Set.add (Set.add acc atom) atom'
        | Stoi (atom, atom') -> Set.add (Set.add acc atom) atom'
        | Itos (atom, atom') -> Set.add (Set.add acc atom) atom'
@@ -518,6 +531,7 @@ let collect_atoms ir =
        | Reg (_, atoms) -> Set.union acc (atoms |> Set.of_list)
        | SReg (atom, _) -> Set.add acc atom
        | SRegRaw (atom, _) -> Set.add acc atom
+       | SLenConst specs -> List.fold_left (fun acc (a, _) -> Set.add acc a) acc specs
        | SLen (atom, atom')
        | Stoi (atom, atom')
        | SPrefixOf (atom, atom')
@@ -543,6 +557,7 @@ let collect_free_atoms ir =
        | Reg (_, atoms) -> Set.union acc (atoms |> Set.of_list)
        | SReg (atom, _) -> Set.add acc atom
        | SRegRaw (atom, _) -> Set.add acc atom
+       | SLenConst specs -> List.fold_left (fun acc (a, _) -> Set.add acc a) acc specs
        | SLen (atom, atom')
        | Stoi (atom, atom')
        | SPrefixOf (atom, atom')
@@ -568,6 +583,7 @@ let collect_free (ir : t) =
          term |> Map.keys |> List.map as_var |> Set.of_list |> Set.union acc
        | SReg (atom, _) -> Set.add acc atom
        | SRegRaw (atom, _) -> Set.add acc atom
+       | SLenConst specs -> List.fold_left (fun acc (a, _) -> Set.add acc a) acc specs
        | SLen (atom, atom')
        | Stoi (atom, atom')
        | Itos (atom, atom')
@@ -825,9 +841,26 @@ let simpl ir =
 ;;
 
 let simpl_ineq ir =
-  (* Bounds are collected across the whole tree and re-emitted conjoined, which is
-     only sound because every [Ir] pass is given a conjunction. Merging an upper
-     bound with [min] across the arms of a [Lor] would strengthen the formula. *)
+  (* Bounds are collected and re-emitted conjoined, so both the collection and
+     the erasure below must stay on the top-level conjunctive spine: merging an
+     upper bound with [min] across the arms of a [Lor] (or from under a [Lnot])
+     would strengthen the formula -- e.g. [x <= 0 /\ (x = 1 \/ x = 0)] used to
+     collapse to false by combining [x = 1] from one arm with the rest. The
+     arms themselves are simplified recursively by the wrapper at the bottom. *)
+  let fold_conj f init ir =
+    let rec go acc = function
+      | Land irs -> List.fold_left go acc irs
+      | ir -> f acc ir
+    in
+    go init ir
+  in
+  let map_conj f ir =
+    let rec go = function
+      | Land irs -> land_ (List.map go irs)
+      | ir -> f ir
+    in
+    go ir
+  in
   let simpl_ineq ir =
     let merge lowb uppb =
       let merge_bounds f = function
@@ -840,7 +873,7 @@ let simpl_ineq ir =
       merge_bounds max (lowb1, lowb2), merge_bounds min (uppb1, uppb2)
     in
     let bounds =
-      fold
+      fold_conj
         (fun list -> function
            | Rel (Eq, term, c) when Map.length term = 1 ->
              let var, coeff = Map.min_elt_exn term in
@@ -862,7 +895,7 @@ let simpl_ineq ir =
        when [c] does not divide [rhs] -- so those are simply not recorded, and get
        erased below along with the rest. *)
     let forbidden =
-      fold
+      fold_conj
         (fun list -> function
            | Rel (Neq, term, c) when Map.length term = 1 ->
              let var, coeff = Map.min_elt_exn term in
@@ -906,7 +939,7 @@ let simpl_ineq ir =
           values)
     in
     let ir_without_eq_n_leq =
-      map
+      map_conj
         (function
           | Rel (Eq, term, c) when Map.length term = 1 -> true_
           | Rel (Leq, term, c) when Map.length term = 1 -> true_
@@ -936,7 +969,7 @@ let simpl_ineq ir =
     in
     let complex_bounds_map =
       let complex_bounds =
-        fold
+        fold_conj
           (fun list -> function
              | Rel (Leq, term, value) -> (term, value) :: list
              | _ -> list)
@@ -950,7 +983,7 @@ let simpl_ineq ir =
         | [] -> assert false)
     in
     let ir_without_leq =
-      map
+      map_conj
         (function
           | Rel (Leq, term, c) -> true_
           | ir -> ir)
@@ -971,13 +1004,22 @@ let simpl_ineq ir =
     let ir = land_ (List.concat [ irs'; neq_irs; ir_without_leq :: irs ]) |> simpl in
     ir
   in
-  map
-    (function
-      | Exists (v, ir) -> exists v (simpl_ineq ir)
-      | Lnot ir' -> lnot (simpl_ineq ir')
-      | ir -> ir)
-    ir
-  |> simpl_ineq
+  (* Single top-down visit: walk the conjunctive spine and give each
+     disjunct/binder body its own recursive treatment, then run the
+     bound-merging pass on the spine. Recursing through [map] instead (which
+     visits every node) re-ran the whole pass once per [Lor] node per level
+     -- exponential on the disjunction-heavy IRs the string suites produce. *)
+  let rec top ir =
+    let rec descend = function
+      | Land irs -> land_ (List.map descend irs)
+      | Lor irs -> lor_ (List.map top irs)
+      | Lnot ir' -> lnot (top ir')
+      | Exists (v, ir') -> exists v (top ir')
+      | ir -> ir
+    in
+    simpl_ineq (descend ir)
+  in
+  top ir
 ;;
 
 let%expect_test _ =
@@ -1092,6 +1134,7 @@ let pin_unconstrained_vars ir =
     | Rel (_, poly, _) -> Map.keys poly
     | Reg (_, atoms) -> atoms
     | SReg (a, _) | SRegRaw (a, _) -> [ a ]
+    | SLenConst specs -> List.map fst specs
     | SPrefixOf (a, b)
     | SSuffixOf (a, b)
     | SContains (a, b)

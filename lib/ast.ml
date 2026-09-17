@@ -190,7 +190,7 @@ module Eia = struct
     | Bwor (a, b) -> Format.fprintf ppf "(%a | %a)" pp_term a pp_term b
     | Bwxor (a, b) -> Format.fprintf ppf "(%a ^ %a)" pp_term a pp_term b
     | Bwand (a, b) -> Format.fprintf ppf "(%a & %a)" pp_term a pp_term b
-    | Pow (a, b) -> Format.fprintf ppf "(exp %a %a)" pp_term a pp_term b
+    | Pow (a, b) -> Format.fprintf ppf "(** %a %a)" pp_term a pp_term b
     | Len2 a -> Format.fprintf ppf "@[(chrob.len %a)@]" pp_term a
     | Mod (t, z) -> Format.fprintf ppf "(mod %a %a)" pp_term t Z.pp_print z
     (* Strings  *)
@@ -461,11 +461,12 @@ module Eia = struct
     fun lhs rhs kind ->
     match kind with
     | I ->
-      begin match lhs, rhs with
-      | Pow (Const c, lhs), Pow (Const d, rhs)
-        when Z.equal c d && Z.(geq (abs c) (of_int 2)) -> eq lhs rhs kind
-      | lhs, rhs -> eq (add [ lhs; mul [ const Z.minus_one; rhs ] ]) (Const Z.zero) I
-      end
+      (* No cancellation of equal bases here: [b^l = b^r] is NOT equivalent
+         to [l = r] under the standard's total semantics -- both sides are 0
+         for any pair of negative exponents (x = -1, y = -2 satisfies
+         [2^x = 2^y]). This constructor runs at [Fe.to_ast] time, before the
+         totalization pass could ever see the power. *)
+      eq (add [ lhs; mul [ const Z.minus_one; rhs ] ]) (Const Z.zero) I
     | S -> eq lhs rhs S
   ;;
 
@@ -559,6 +560,8 @@ module Eia = struct
   ;;
 
   let pp fmt = function
+    | Eq (Mod (term, term'), Const z, I) when Z.equal z Z.zero ->
+      Format.fprintf fmt "@[(divides %a %a)@]" Z.pp_print term' pp_term term
     | Eq (term, term', _) -> Format.fprintf fmt "@[(= %a %a)@]" pp_term term pp_term term'
     | Neq (term, term', _) ->
       Format.fprintf fmt "@[(distinct %a %a)@]" pp_term term pp_term term'
@@ -759,6 +762,8 @@ let eia = function
   | eia -> Eia eia
 ;;
 
+let divides b a = Eia (Eia.Eq (Eia.Mod (a, b), Eia.Const Z.zero, I))
+
 let rec lnot = function
   | Lnot ast -> ast
   | Land asts -> lor_ (List.map lnot asts)
@@ -826,7 +831,7 @@ let pp_term_smtlib2 =
         fprintf ppf "@[(- %a)@]" pp_eia v
       | Mul xs ->
         fprintf ppf "@[(* %a)@]" (pp_print_list pp_eia ~pp_sep:pp_print_space) xs
-      | Pow (base, p) -> fprintf ppf "(exp %a %a)" pp_eia base pp_eia p
+      | Pow (base, p) -> fprintf ppf "(** %a %a)" pp_eia base pp_eia p
       | x -> Eia.pp_term ppf x
   in
   pp_eia
@@ -1330,7 +1335,9 @@ let to_nat ast =
              (fun acc _ -> acc)
              (acc_plus, acc_minus)
              eia'
-         | Lor _ -> failwith "to_nat expected conjunct"
+         (* [fold] visits the arms of a [Lor] on its own, and [vary]'s
+            substitution commutes with disjunction, so sign-splitting is
+            sound under one -- no reason to reject it. *)
          | ast -> acc_plus, acc_minus)
       (Set.empty, Set.empty)
   in
@@ -1351,7 +1358,6 @@ let to_nat ast =
                    | eia' -> eia')
                  Fun.id
                  eia')
-          | Lor _ -> failwith "to_nat expected conjunct"
           | ast -> ast)
         ast
     ]
@@ -1385,9 +1391,15 @@ let find_common_base ast =
          | Eia eia ->
            Eia.fold2
              (fun acc -> function
-                | Eia.Pow (Const d, _) when Option.is_some acc && Option.get acc <> d ->
+                (* [SimplII.std_exp_split] rewrites a negative constant base
+                   into its absolute value (with a parity split) and
+                   eliminates bases 0 and +-1 entirely, so only |d| >= 2
+                   matters for the automata track base. *)
+                | Eia.Pow (Const d, _) when Z.(leq (abs d) one) -> acc
+                | Eia.Pow (Const d, _)
+                  when Option.is_some acc && Option.get acc <> Z.abs d ->
                   raise_notrace Different_bases
-                | Eia.Pow (Const d, _) -> Some d
+                | Eia.Pow (Const d, _) -> Some (Z.abs d)
                 | _ -> acc)
              (fun acc _ -> acc)
              acc

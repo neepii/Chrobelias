@@ -6,8 +6,9 @@ module Sequence = Base.Sequence
 
 exception Too_big_nfa
 
-(** Raised by [all_paths_of_len ~limit] when the BFS frontier exceeds [limit].
-    Callers passing [~limit] are expected to catch it and degrade to unknown. *)
+(** Raised by [all_paths_of_len ~limit] when the language holds more than
+    [limit] words of the requested length. Callers passing [~limit] are
+    expected to catch it and degrade to unknown. *)
 exception Too_dense_graph
 
 type state = int
@@ -97,7 +98,7 @@ module type Type = sig
 
   val run : t -> bool
   val re_accepts : v list -> t -> bool
-  val any_path : t -> int list -> (v list list * int) option
+  val any_path : ?prefer:int list -> t -> int list -> (v list list * int) option
   val any_n_paths : t -> ?len:int -> int -> v list list
   val any_n_paths_range : t -> ?len:int -> int -> v list list
   val all_paths_of_len : t -> ?limit:int -> int -> v list list
@@ -129,7 +130,7 @@ end
 module type NatType = sig
   include Type
 
-  val chrobak : t -> (int * int) Seq.t
+  val chrobak : ?max_states:int -> t -> (int * int) Seq.t * int option
 
   val get_chrobaks_sub_nfas
     :  t

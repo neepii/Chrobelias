@@ -1,13 +1,14 @@
 QF_EIA tests with x, exp x and exp exp x using only NFAs
 
-This works bad on alpine since timeout returns [1].
-$ timeout 5 Chro ../manyexp/issue188.smt2 
-timeout
-[124]
+Dynamic bres/bstates solve this under default flags (it used to time out):
+
+  $ Chro -q -no-model ../manyexp/issue188.smt2
+  sat (under int)
+  no-model mode
 
 QF_EIA tests with x, exp x and exp exp x using underapproximations
 
-  $ timeout 5 Chro -bres 2 -bstates 10 ../manyexp/issue188.smt2 
+  $ timeout 5 Chro ../manyexp/issue188.smt2 
   sat (nfa)
   (
      (define-fun t () Int
@@ -22,7 +23,7 @@ QF_EIA tests with x, exp x and exp exp x using underapproximations
 
 The same tests with three exponentiated vars in the LSB mode
 
-  $ Chro -lsb -bres 2 -bstates 10 ../manyexp/issue188.smt2
+  $ Chro -lsb ../manyexp/issue188.smt2
   sat (nfa)
   (
      (define-fun t () Int
@@ -42,10 +43,10 @@ The same tests with three exponentiated vars in the LSB mode
   > (set-logic ALL)
   > (declare-fun x () Int)
   > (declare-fun t () Int)
-  > (assert (= (mod (+ x (exp 2 x) (exp 2 (exp 2 x))) 100) t))
+  > (assert (= (mod (+ x (** 2 x) (** 2 (** 2 x))) 100) t))
   > (assert (<= t 45))
   > (assert (>= t 35))
   > (check-sat)
   > EOF
-  $ Chro -bres 2 -bstates 10 test1.smt2
-  sat (nfa)
+  $ Chro test1.smt2
+  sat (under int)

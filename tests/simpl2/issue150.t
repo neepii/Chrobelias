@@ -8,9 +8,20 @@
     (<= (* (- 444) u) 0)
     (<= (* (- 1) x) 0)
     (str.in_re.raw x)
-    (chrob.len x (exp 10 strlenx)))
+    (chrob.len x (** 10 strlenx)))
 $ Chro -no-over-approx -bound -1 issue117.smt2 | sed 's/[[:space:]]*$//'
 
 
-  $ timeout 5 Chro -no-over -bound -1 -bstates 10 -bres 1 ../examples/issue150.smt2 2>&1 | sed 's/[[:space:]]*$//'
-  timeout
+
+  $ timeout 60 Chro -no-over -bound -1 ../examples/issue150.smt2 2>&1 | sed 's/[[:space:]]*$//'
+  sat (nfa)
+  (
+     (define-fun u () Int
+      0)
+     (define-fun v () Int
+      0)
+     (define-fun w () Int
+      105428759)
+     (define-fun x () String
+      "123457076789")
+  )

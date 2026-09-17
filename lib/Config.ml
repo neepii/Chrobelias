@@ -1,12 +1,13 @@
 type config =
   { mutable antiprenex_mode : [ `All | `Push_re | `Disable ]
+  ; mutable dyn_bounds : bool
   ; mutable bound_res : int
   ; mutable bound_states : int
+  ; mutable bound_quantifier_elim : Z.t
   ; mutable base : int option
   ; mutable dump_simpl : bool
   ; mutable dump_pre_simpl : bool
   ; mutable dump_ir : bool
-  ; mutable error_check : bool
   ; mutable good_for_minimize : int
   ; mutable good_for_shrinking : int
   ; mutable input_file : string
@@ -21,11 +22,11 @@ type config =
   ; mutable no_model : bool
   ; mutable no_str_bv : bool
   ; mutable over_approx : bool
-  ; mutable over_approx_early : bool
   ; mutable over_nfa : bool
   ; mutable pre_simpl : bool
   ; mutable quiet : bool
   ; mutable simpl_alpha : bool
+  ; mutable simpl_quantifier_elim : bool
   ; mutable simpl_mono : bool
   ; mutable stop_after : [ `Pre_dpll | `Pre_simplify | `Simpl | `Solving ]
   ; mutable under_approx : int
@@ -42,19 +43,19 @@ type config =
 
 let config =
   { antiprenex_mode = `All
+  ; dyn_bounds = true
   ; bound_res = -1
   ; bound_states = -1
+  ; bound_quantifier_elim = Z.of_int 1000000
   ; base = None
   ; stop_after = `Solving
   ; dump_pre_simpl = false
   ; dump_simpl = false
   ; dump_ir = false
-  ; error_check = true
   ; good_for_minimize = 15
   ; good_for_shrinking = 20
   ; pre_simpl = true
   ; over_approx = true
-  ; over_approx_early = false
   ; over_nfa = false
   ; input_file = ""
   ; logic = `Eia
@@ -65,6 +66,7 @@ let config =
   ; no_str_bv = false
   ; quiet = false
   ; simpl_alpha = false
+  ; simpl_quantifier_elim = false
   ; simpl_mono = true
   ; with_check_sat = false
   ; with_info = true
@@ -82,12 +84,6 @@ let config =
    under load makes the expected outputs flap. Same idea as CHRO_OMIT_Z3_MODEL. *)
 let () = if Sys.getenv_opt "CHRO_NO_PARALLEL" <> None then config.parallel <- false
 let is_quiet () = config.quiet
-
-type under2_config =
-  { mutable amin : int
-  ; mutable amax : int
-  ; mutable flat : int [@warning "-69"]
-  }
 
 type under_str_config =
   { mutable max_len : int
@@ -117,10 +113,7 @@ let huge_const_config = { const = 20; const_model = 120; path = 10000 }
 let huge_const () = huge_const_config.const
 let huge_path () = huge_const_config.path
 let huge_const_for_model () = huge_const_config.const_model
-let under2_config = { amin = 5; amax = 11; flat = -1 }
 let under_str_config = { max_len = 32; max_cnt = 32; max_envs = 8192 }
-let get_flat () = under2_config.flat
-let is_under2_enabled () = get_flat () >= 0
 let bounded_unsat = ref false
 let string_config = { zero = '0'; one = '1'; null = Char.chr 0; eos = Char.chr 3 }
 let base = ref 10
@@ -132,13 +125,75 @@ let set_base ?ast_base () =
        config.base
 ;;
 
-let max_longest_path =
-  match Sys.getenv_opt "CHRO_LONGEST_PATH" with
-  | None -> huge_path ()
+let dyn_leaf_budget =
+  match Sys.getenv_opt "CHRO_DYN_LEAVES" with
+  | None -> 16
   | Some s ->
     (match int_of_string_opt s with
      | Some n -> n
      | None -> exit 1)
+;;
+
+let dyn_scan_budget =
+  match Sys.getenv_opt "CHRO_DYN_SCAN" with
+  | None -> 144
+  | Some s ->
+    (match int_of_string_opt s with
+     | Some n -> n
+     | None -> exit 1)
+;;
+
+(* Retries the elimination may make before giving up. Unlimited by default;
+   capping it pins one truncation level, which is how the gate that turns a
+   truncated refutation into [unknown] is tested. *)
+let dyn_max_attempts =
+  match Sys.getenv_opt "CHRO_DYN_ATTEMPTS" with
+  | None -> max_int
+  | Some s ->
+    (match int_of_string_opt s with
+     | Some n -> n
+     | None -> exit 1)
+;;
+
+let dyn_scale = ref 1
+let dyn_budget = ref 0
+let dyn_reset_budget () = dyn_budget := dyn_leaf_budget * !dyn_scale
+
+(* Truncation is sound only where the caller wants an under-approximation.
+   The elimination does; [Overapprox.in_re] wants the opposite and trusts its
+   own Unsat. So the bounds apply inside the elimination stage only, set by
+   [Solver.check_sat]; every other ChrobakNF stays exact. *)
+let dyn_stage = ref false
+
+(* State cap for the regex length folding in [Overapprox.in_re] and
+   [SimplII.arithmetize_in_re]. Sound only because [Nfa.chrobak] reports
+   [exhaustive_upto] and both callers add a "len > that" disjunct, keeping the
+   abstraction an over-approximation. *)
+let regex_cap =
+  match Sys.getenv_opt "CHRO_REGEX_CAP" with
+  | None -> 20
+  | Some s ->
+    (match int_of_string_opt s with
+     | Some n -> n
+     | None -> exit 1)
+;;
+
+let dyn_enabled () = config.dyn_bounds && !dyn_stage
+
+let in_dyn_stage f =
+  let saved = !dyn_stage in
+  dyn_stage := true;
+  Fun.protect ~finally:(fun () -> dyn_stage := saved) f
+;;
+
+let residue_bound c =
+  if not (dyn_enabled ())
+  then -1
+  else (
+    let rem = !dyn_budget in
+    let r = if rem <= 0 then 2 else min c (max 2 rem) in
+    dyn_budget := rem - min c r;
+    if r >= c then -1 else r)
 ;;
 
 let max_nfa_size =
@@ -172,11 +227,18 @@ Basic options:
     [ ( "-bound"
       , Arg.Int (fun n -> config.under_approx <- n)
       , "\tUpper bound for integer underapproximation (negative disables)" )
+    ; ( "-no-dyn-bounds"
+      , Arg.Unit (fun () -> config.dyn_bounds <- false)
+      , "\tRun the exponent elimination unbounded instead of deriving its caps from each \
+         Chrobak automaton" )
     ; ( "-bres"
       , Arg.Int (fun n -> config.bound_res <- n)
       , "<n>\tMaximal residue used in the NFA Solver" )
     ; ( "-bstates"
       , Arg.Int (fun n -> config.bound_states <- n)
+      , "<n>\tMaximal number of states in NFAs used in ChrobakNF construction" )
+    ; ( "-bqelim"
+      , Arg.String (fun s -> config.bound_quantifier_elim <- Z.of_string s)
       , "<n>\tMaximal number of states in NFAs used in ChrobakNF construction" )
     ; ( "-huge-c"
       , Arg.Int (fun n -> huge_const_config.const <- n)
@@ -225,9 +287,6 @@ Basic options:
       (*; ( "-over"
       , Arg.Unit (fun () -> config.over_approx <- true)
       , "\tSimple overapprox" )*)
-      (* ; ( "-over-early"
-      , Arg.Unit (fun () -> config.over_approx_early <- true)
-      , "\tSimple overapprox before underapprox II" ) *)
     ; ( "-under-all"
       , Arg.Unit (fun () -> config.under_str_all <- true)
       , "  \tApply string underapproximation for each string variable" )
@@ -277,6 +336,9 @@ Basic options:
     ; ( "--alpha"
       , Arg.Unit (fun () -> config.simpl_alpha <- true)
       , "\tDO simplifications based on alpha-equivalence" ) *)
+    ; ( "--qelim"
+      , Arg.Unit (fun () -> config.simpl_quantifier_elim <- true)
+      , "\tApply quantifier elimination for linear systems" )
     ; ( "--over-nfa"
       , Arg.Unit (fun () -> config.over_nfa <- true)
       , "\tOverapproximate orderings within the NFA Solver" )

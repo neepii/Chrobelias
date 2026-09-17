@@ -7,11 +7,19 @@ module Set = Base.Set.Poly
 module Map = Base.Map.Poly
 module Sequence = Base.Sequence
 
-(** Raised by [all_paths_of_len ~limit] when the BFS frontier exceeds [limit].
-    Callers passing [~limit] are expected to catch it and degrade to unknown. *)
+(** Raised by [all_paths_of_len ~limit] when the language holds more than
+    [limit] words of the requested length. Callers passing [~limit] are
+    expected to catch it and degrade to unknown. *)
 exception Too_dense_graph
 
-let config = Config.config
+let effective_bound_states n =
+  if not (Config.dyn_enabled ())
+  then -1
+  else (
+    let s = Config.dyn_scan_budget * !Config.dyn_scale in
+    if n * n <= s then -1 else int_of_float (sqrt (float_of_int s)))
+;;
+
 let trace_log fmt = Debug.trace "nfa" fmt
 
 exception Too_big_nfa
@@ -39,6 +47,15 @@ let rec pow a = function
   | n ->
     let b = pow a (n / 2) in
     b * b * if n mod 2 = 0 then 1 else a
+;;
+
+let rec seq_round_robin seqs () =
+  match seqs with
+  | [] -> Seq.Nil
+  | s :: rest ->
+    (match s () with
+     | Seq.Nil -> seq_round_robin rest ()
+     | Seq.Cons (x, tl) -> Seq.Cons (x, seq_round_robin (rest @ [ tl ])))
 ;;
 
 module type L = sig
@@ -779,10 +796,11 @@ module Graph (Label : L) = struct
 
   let find_important_verticies graph =
     let bound x =
-      if config.bound_states > 0
+      let b = effective_bound_states (List.length x) in
+      if b > 0 && b < List.length x
       then (
         Config.bounded_unsat := true;
-        List.take config.bound_states x)
+        List.take b x)
       else x
     in
     find_strongly_connected_components graph
@@ -908,7 +926,7 @@ module type Type = sig
 
   val run : t -> bool
   val re_accepts : v list -> t -> bool
-  val any_path : t -> int list -> (v list list * int) option
+  val any_path : ?prefer:int list -> t -> int list -> (v list list * int) option
   val any_n_paths : t -> ?len:int -> int -> v list list
   val any_n_paths_range : t -> ?len:int -> int -> v list list
   val all_paths_of_len : t -> ?limit:int -> int -> v list list
@@ -940,7 +958,7 @@ end
 module type NatType = sig
   include Type
 
-  val chrobak : t -> (int * int) Seq.t
+  val chrobak : ?max_states:int -> t -> (int * int) Seq.t * int option
 
   val get_chrobaks_sub_nfas
     :  t
@@ -1484,16 +1502,26 @@ struct
     }
   ;;
 
-  let find_c_d nfa (imp : (int, int) Map.t) =
+  (* [max_states] limits the state count explicitly; omitting it defers to the
+     elimination stage's dynamic bound. Returns the progressions together with
+     [exhaustive_upto]: the offset scan enumerates every accepted length at or
+     below it, and [None] means nothing was limited so the result is complete.
+     Only lengths past that point can go missing, so a caller needing an
+     over-approximation compensates with one "len > exhaustive_upto" disjunct
+     rather than giving up the limit entirely. *)
+  let find_c_d ?(max_states = -1) nfa (imp : (int, int) Map.t) =
     assert (Set.length nfa.start = 1);
+    let limited = max_states >= 0 in
     let n =
-      if config.bound_states > 2 && config.bound_states < length nfa
+      let b = if limited then max_states else effective_bound_states (length nfa) in
+      if b > 2 && b < length nfa
       then (
-        Config.bounded_unsat := true;
-        max 2 config.bound_states)
+        if not limited then Config.bounded_unsat := true;
+        max 2 b)
       else max 2 (length nfa)
     in
     let m = n * n in
+    let exhaustive_upto = if n < length nfa then Some m else None in
     let t =
       Graph.reachable_in_range (Graph.reverse nfa.transitions) 0 (m - n - 1) nfa.final
       |> Array.of_list
@@ -1535,11 +1563,12 @@ struct
         not (List.exists (fun (c1, d) -> c mod d = c1 mod d && c >= c1) r2))
       |> List.map (fun c -> c, 0)
     in
-    r2 @ r1 |> Set.of_list |> Set.to_sequence |> Sequence.to_seq
+    r2 @ r1 |> Set.of_list |> Set.to_sequence |> Sequence.to_seq, exhaustive_upto
   ;;
 
   let find_c_d' nfa =
     find_c_d nfa (Set.to_list nfa.start |> List.map (fun a -> a, 0) |> Map.of_alist_exn)
+    |> fst
   ;;
 
   let split (nfa : t) =
@@ -1623,9 +1652,12 @@ struct
     |> remove_unreachable_from_final
   ;;
 
-  let any_path ?nozero (nfa : t) vars =
+  let any_path ?nozero ?(prefer = []) (nfa : t) vars =
     let transitions = nfa.transitions in
     let nozero = nozero |> Option.value ~default:false in
+    let key_order =
+      prefer @ (List.init nfa.deg Fun.id |> List.filter (fun i -> not (List.mem i prefer)))
+    in
     (*let q =
       let visited = Array.make (length nfa) false in
       let rec dfs len q =
@@ -1658,7 +1690,18 @@ struct
           else begin
             visited.(hd) <- true;
             let new_paths =
-              Array.get transitions hd |> List.map (fun part -> part :: path)
+              (* Sorted expansion makes the first BFS hit the lex-smallest
+                 shortest path (numerically smallest on Msb); the [prefer]
+                 tracks win the tie-break. *)
+              Array.get transitions hd
+              |> (if List.is_empty vars && List.is_empty prefer
+                  then Fun.id
+                  else
+                    List.sort (fun (l1, _) (l2, _) ->
+                      Stdlib.compare
+                        (List.map (Label.get l1) key_order)
+                        (List.map (Label.get l2) key_order)))
+              |> List.map (fun part -> part :: path)
             in
             let path' =
               List.find_opt
@@ -1692,56 +1735,99 @@ struct
     | None -> None
   ;;
 
-  let any_n_paths_helper (nfa : t) ?len ?n ?limit sign =
-    let transitions = nfa.transitions in
-    let p =
-      let frontier = Queue.create () in
-      let rec bfs cool_paths =
-        let cool_paths_cnt = Set.length cool_paths in
-        match Queue.take_opt frontier with
-        | _ when Queue.length frontier >= Option.value ~default:Int.max_int limit ->
-          raise Too_dense_graph
-        | None -> cool_paths
-        | Some _ when Option.is_some n && cool_paths_cnt >= Option.get n -> cool_paths
-        | Some path when Option.is_some len && List.length path > Option.get len + 1 ->
-          bfs cool_paths
-        | Some path
-          when Option.is_some n
-               && List.length path > Array.length nfa.transitions * Option.get n ->
-          bfs cool_paths
-        | Some ((_, hd) :: _ as path) ->
-          let new_paths =
-            Array.get transitions hd |> List.map (fun part -> part :: path)
-          in
-          let cool_paths' =
-            List.filter (fun path' -> Set.mem nfa.final (List.hd path' |> snd)) new_paths
-            |> List.map (fun path' ->
-              path'
-              |> List.map (fun (label, q') -> label)
-              |> List.map (fun label -> Label.get label 0)
-              |> List.drop_while (( = ) Label.u_eos))
-            |> List.filter (fun path' ->
-              Option.is_none len || sign (List.length path') (Option.get len + 1))
-          in
-          let cool_paths = Set.union cool_paths (cool_paths' |> Set.of_list) in
-          List.iter (fun path' -> Queue.add path' frontier) new_paths;
-          bfs cool_paths
-        | Some [] -> failwith ""
+  let enum_words (nfa : t) ~max_len =
+    let max_len = Int.max 0 max_len in
+    let n_states = Array.length nfa.transitions in
+    let is_eos label = Label.get label 0 = Label.u_eos in
+    let fin =
+      let fin = Array.make n_states false in
+      let rev_eos = Array.make n_states [] in
+      Array.iteri
+        (fun q delta ->
+           List.iter
+             (fun (label, q') -> if is_eos label then rev_eos.(q') <- q :: rev_eos.(q'))
+             delta)
+        nfa.transitions;
+      let rec close q =
+        if not fin.(q)
+        then (
+          fin.(q) <- true;
+          List.iter close rev_eos.(q))
       in
-      Set.iter ~f:(fun q -> Queue.add [ Label.zero nfa.deg, q ] frontier) nfa.start;
-      bfs Set.empty
+      Set.iter ~f:close nfa.final;
+      fin
     in
-    p |> Set.to_list
+    let ok_rows = ref [| fin |] in
+    let ok_row k =
+      while Array.length !ok_rows <= k do
+        let rows = !ok_rows in
+        let prev = rows.(Array.length rows - 1) in
+        let next =
+          Array.map
+            (List.exists (fun (label, q') -> (not (is_eos label)) && prev.(q')))
+            nfa.transitions
+        in
+        ok_rows := Array.append rows [| next |]
+      done;
+      !ok_rows.(k)
+    in
+    fun len ->
+      if len < 0 || len > max_len
+      then Seq.empty
+      else (
+        let rec walk states k () =
+          if k = 0
+          then
+            if List.exists (fun q -> fin.(q)) states
+            then Seq.Cons ([], Seq.empty)
+            else Seq.Nil
+          else (
+            let succ_ok = ok_row (k - 1) in
+            states
+            |> List.concat_map (fun q -> nfa.transitions.(q))
+            |> List.filter_map (fun (label, q') ->
+              if (not (is_eos label)) && succ_ok.(q')
+              then Some (Label.get label 0, q')
+              else None)
+            |> Map.of_alist_multi
+            |> Map.to_alist
+            |> List.map (fun (c, qs) ->
+              Seq.map (fun w -> c :: w) (walk (List.sort_uniq compare qs) (k - 1)))
+            |> seq_round_robin
+            |> fun seq -> seq ())
+        in
+        walk (Set.to_list nfa.start) len |> Seq.map List.rev)
   ;;
 
-  let any_n_paths (nfa : t) ?len n = any_n_paths_helper nfa ?len ~n (fun x y -> x = y)
+  let enum_words_upto (nfa : t) ~max_len =
+    let enum = enum_words nfa ~max_len in
+    Seq.init (max_len + 1) Fun.id |> Seq.concat_map enum
+  ;;
+
+  let any_n_paths (nfa : t) ?len n =
+    (match len with
+     | Some len -> enum_words nfa ~max_len:len len
+     | None -> enum_words_upto nfa ~max_len:(length nfa * Int.max 1 n))
+    |> Seq.take (Int.max 0 n)
+    |> List.of_seq
+  ;;
 
   let any_n_paths_range (nfa : t) ?len n =
-    any_n_paths_helper nfa ?len ~n (fun x y -> x <= y)
+    let max_len =
+      match len with
+      | Some len -> len
+      | None -> length nfa * Int.max 1 n
+    in
+    enum_words_upto nfa ~max_len |> Seq.take (Int.max 0 n) |> List.of_seq
   ;;
 
   let all_paths_of_len (nfa : t) ?limit len =
-    any_n_paths_helper nfa ~len ?limit (fun x y -> x = y)
+    let words = enum_words nfa ~max_len:len len in
+    match limit with
+    | None -> List.of_seq words
+    | Some limit ->
+      let words = words |> Seq.take (limit + 1) |> List.of_seq in
+      if List.length words > limit then raise Too_dense_graph else words
   ;;
 
   let re_accepts path nfa =
@@ -1934,7 +2020,7 @@ module Lsb (Label : L) = struct
     result
   ;;
 
-  let chrobak nfa =
+  let chrobak ?(max_states = -1) nfa =
     Debug.dump_nfa ~msg:"Chrobak input: %s" format_nfa nfa;
     let important =
       Graph.find_important_verticies nfa.transitions
@@ -1946,7 +2032,13 @@ module Lsb (Label : L) = struct
       (Format.pp_print_list ~pp_sep:Format.pp_print_space (fun fmt (a, b) ->
          Format.fprintf fmt "(%d: %d)" a b))
       (Map.to_alist important);
-    let result = find_c_d nfa important in
+    let result, exhaustive_upto = find_c_d ~max_states nfa important in
+    let result =
+      result
+      |> List.of_seq
+      |> List.sort (fun (_, period1) (_, period2) -> compare period1 period2)
+      |> List.to_seq
+    in
     (* trace_log "Chrobak output: "; *)
     (* trace_log *)
     (*   "%a\n" *)
@@ -1954,7 +2046,7 @@ module Lsb (Label : L) = struct
     (*      ~pp_sep:(fun fmt () -> Format.fprintf fmt "; ") *)
     (*      (fun fmt (a, b) -> Format.fprintf fmt "(%d, %d)" a b)) *)
     (*   result; *)
-    result
+    result, exhaustive_upto
   ;;
 
   let path_of_len2 (nfa : t) ~var ~len : v list option =
@@ -2051,7 +2143,7 @@ module Lsb (Label : L) = struct
       let model_piece =
         if no_model then fun _ -> Some ([], 0) else path_of_len chrobak_nfa ~vars ~exp:res
       in
-      return (nfa, chrobak chrobak_nfa, model_piece))
+      return (nfa, chrobak chrobak_nfa |> fst, model_piece))
   ;;
 
   let to_nat (nfa : t) : u = nfa
@@ -2276,7 +2368,7 @@ module MsbNat (Label : L) = struct
     result, start, path_nfa
   ;;
 
-  let chrobak nfa =
+  let chrobak ?(max_states = -1) nfa =
     Debug.dump_nfa ~msg:"Chrobak input: %s" format_nfa nfa;
     let important =
       Graph.find_important_verticies nfa.transitions
@@ -2288,7 +2380,13 @@ module MsbNat (Label : L) = struct
       (Format.pp_print_list ~pp_sep:Format.pp_print_space (fun fmt (a, b) ->
          Format.fprintf fmt "(%d: %d)" a b))
       (Map.to_alist important);
-    let result = find_c_d nfa important in
+    let result, exhaustive_upto = find_c_d ~max_states nfa important in
+    let result =
+      result
+      |> List.of_seq
+      |> List.sort (fun (_, period1) (_, period2) -> compare period1 period2)
+      |> List.to_seq
+    in
     trace_log "Chrobak output: ";
     trace_log
       "%a\n"
@@ -2296,7 +2394,7 @@ module MsbNat (Label : L) = struct
          ~pp_sep:(fun fmt () -> Format.fprintf fmt "; ")
          (fun fmt (a, b) -> Format.fprintf fmt "(%d, %d)" a b))
       (result |> List.of_seq);
-    result
+    result, exhaustive_upto
   ;;
 
   let path_of_len (nfa : t) ~vars ~exp total_len : (v list list * int) option =
@@ -2386,7 +2484,7 @@ module MsbNat (Label : L) = struct
               ~vars
               ~exp:res
         in
-        return (nfa, chrobak chrobak_nfa, model_piece))
+        return (nfa, chrobak chrobak_nfa |> fst, model_piece))
   ;;
 
   (*let to_nat (nfa : t) : u =
@@ -2441,7 +2539,7 @@ let%expect_test "find_c_d smoke test" =
     }
   in
   let imp = Map.of_alist_exn [ 0, 2; 1, 2 ] in
-  print (find_c_d nfa imp |> List.of_seq);
+  print (find_c_d nfa imp |> fst |> List.of_seq);
   [%expect {|1, 2|}]
 ;;
 
@@ -2515,9 +2613,9 @@ module Msb (Label : L) = struct
     | false, other -> nfa |> minimize_strong |> shrink
   ;;
 
-  let any_path nfa =
+  let any_path ?prefer nfa =
     Debug.dump_nfa ~msg:"ANY PATH INPUT: %s" format_nfa nfa;
-    any_path ~nozero:true nfa
+    any_path ~nozero:true ?prefer nfa
   ;;
 
   let run nfa = any_path nfa [] |> Option.is_some

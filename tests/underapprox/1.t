@@ -3,8 +3,8 @@
   > (declare-fun x () Int)
   > (declare-fun y () Int)
   > (declare-fun z () Int)
-  > (assert (<= (exp 2  x) x))
-  > (assert (<= (exp 2  y) x))
+  > (assert (<= (** 2  x) x))
+  > (assert (<= (** 2  y) x))
   > (check-sat)
   > EOF
   $ export CHRO_DEBUG=simpl
@@ -14,20 +14,105 @@
   
   [+simpl]
     iter(1)= (and
-             (<= (+ (exp 2 y) (* (- 1) x)) 0)
-             (<= (+ (exp 2 x) (* (- 1) x)) 0))
+             (<= (+ %stdexp2 (* (- 1) x)) 0)
+             (<= (+ %stdexp4 (* (- 1) x)) 0)
+             (<= (* (- 1) x) 0)
+             (= (+ %stdexp3 (* (- 1) x)) 0)
+             (= (+ %stdexp4 (* (- 1) (** 2 %stdexp3))) 0)
+             (<= (* (- 1) y) 0)
+             (= (+ %stdexp1 (* (- 1) y)) 0)
+             (= (+ %stdexp2 (* (- 1) (** 2 %stdexp1))) 0))
   [+simpl]
     Alphabet with extra char: 0
   
   [+simpl]
+    Something ready to substitute
+        %stdexp1 -> y;
+        %stdexp2 -> (** 2 %stdexp1);
+        %stdexp3 -> x;
+        %stdexp4 -> (** 2 %stdexp3);
+        
+  [+simpl]
     iter(2)= (and
-             (<= (+ (* (- 1) x) (exp 2 x)) 0)
-             (<= (+ (* (- 1) x) (exp 2 y)) 0))
+             (= (+ %stdexp1 (* (- 1) y)) 0)
+             (= (+ %stdexp2 (* (- 1) (** 2 %stdexp1))) 0)
+             (= (+ %stdexp3 (* (- 1) x)) 0)
+             (= (+ %stdexp4 (* (- 1) (** 2 %stdexp3))) 0)
+             (<= (+ %stdexp2 (* (- 1) x)) 0)
+             (<= (+ %stdexp4 (* (- 1) x)) 0)
+             (<= (* (- 1) x) 0)
+             (<= (* (- 1) y) 0))
+  [+simpl]
+    iter(3)= (and
+             (= (+ (** 2 %stdexp1) (* (- 1) (** 2 y))) 0)
+             (= (+ (** 2 %stdexp3) (* (- 1) (** 2 x))) 0)
+             (<= (+ (* (- 1) x) (** 2 %stdexp1)) 0)
+             (<= (+ (* (- 1) x) (** 2 %stdexp3)) 0)
+             (<= (* (- 1) x) 0)
+             (<= (* (- 1) y) 0))
+  [+simpl]
+    iter(4)= (and
+             (<= (+ (* (- 1) x) (** 2 x)) 0)
+             (<= (+ (* (- 1) x) (** 2 y)) 0)
+             (<= (* (- 1) x) 0)
+             (<= (* (- 1) y) 0))
+  [+simpl]
+    fixed-point
+  
+  [+simpl]
+    Basic simplifications:
+  
+  [+simpl]
+    iter(1)= (and
+             (<= (+ %stdexp2 (* (- 1) x)) 0)
+             (<= (+ %stdexp4 (* (- 1) x)) 0)
+             (<= (* (- 1) x) 0)
+             (= (+ %stdexp3 (* (- 1) x)) 0)
+             (= (+ %stdexp4 (* (- 1) (** 2 %stdexp3))) 0)
+             (<= (* (- 1) y) 0)
+             (= (+ %stdexp1 (* (- 1) y)) 0)
+             (= (+ %stdexp2 (* (- 1) (** 2 %stdexp1))) 0))
+  [+simpl]
+    Alphabet with extra char: 0
+  
+  [+simpl]
+    Something ready to substitute
+        %stdexp1 -> y;
+        %stdexp2 -> (** 2 %stdexp1);
+        %stdexp3 -> x;
+        %stdexp4 -> (** 2 %stdexp3);
+        
+  [+simpl]
+    iter(2)= (and
+             (= (+ %stdexp1 (* (- 1) y)) 0)
+             (= (+ %stdexp2 (* (- 1) (** 2 %stdexp1))) 0)
+             (= (+ %stdexp3 (* (- 1) x)) 0)
+             (= (+ %stdexp4 (* (- 1) (** 2 %stdexp3))) 0)
+             (<= (+ %stdexp2 (* (- 1) x)) 0)
+             (<= (+ %stdexp4 (* (- 1) x)) 0)
+             (<= (* (- 1) x) 0)
+             (<= (* (- 1) y) 0))
+  [+simpl]
+    iter(3)= (and
+             (= (+ (** 2 %stdexp1) (* (- 1) (** 2 y))) 0)
+             (= (+ (** 2 %stdexp3) (* (- 1) (** 2 x))) 0)
+             (<= (+ (* (- 1) x) (** 2 %stdexp1)) 0)
+             (<= (+ (* (- 1) x) (** 2 %stdexp3)) 0)
+             (<= (* (- 1) x) 0)
+             (<= (* (- 1) y) 0))
+  [+simpl]
+    iter(4)= (and
+             (<= (+ (* (- 1) x) (** 2 x)) 0)
+             (<= (+ (* (- 1) x) (** 2 y)) 0)
+             (<= (* (- 1) x) 0)
+             (<= (* (- 1) y) 0))
   [+simpl]
     fixed-point
   
   (assert (<= (+ (* (- 1) x) pow2(y) )  0) )
   (assert (<= (+ (* (- 1) x) pow2(x) )  0) )
+  (assert (<= (* (- 1) y)  0) )
+  (assert (<= (* (- 1) x)  0) )
   
 
 
@@ -43,7 +128,7 @@
   
   [+simpl]
     iter(1)= (and
-             (<= (+ 80 (* 77 (exp 2 x1)) (* 42 (exp 2 x2)) (* 575 x2)
+             (<= (+ 80 (* 77 (** 2 x1)) (* 42 (** 2 x2)) (* 575 x2)
                  (* (- 575) x1)) 0)
              (<= (* (- 1) x2) 0)
              (<= (* (- 1) x1) 0))
@@ -52,8 +137,8 @@
   
   [+simpl]
     iter(2)= (and
-             (<= (+ 80 (* 575 x2) (* (- 575) x1) (* 77 (exp 2 x1))
-                 (* 42 (exp 2 x2))) 0)
+             (<= (+ 80 (* 575 x2) (* (- 575) x1) (* 77 (** 2 x1))
+                 (* 42 (** 2 x2))) 0)
              (<= (* (- 1) x1) 0)
              (<= (* (- 1) x2) 0))
   [+simpl]

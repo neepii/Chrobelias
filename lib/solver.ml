@@ -314,10 +314,12 @@ struct
        | Ir.SReg (atom, reg) ->
          Extra.eval_sreg vars atom reg
          |> fun nfa ->
-         trace_log "(c, d)%!";
-         Seq.iter
-           (fun (c, d) -> trace_log "(%d, %d)%!" c d)
-           (NfaNat.chrobak (nfa |> Nfa.to_nat));
+         if Debug.flag ()
+         then (
+           trace_log "(c, d)%!";
+           Seq.iter
+             (fun (c, d) -> trace_log "(%d, %d)%!" c d)
+             (NfaNat.chrobak (nfa |> Nfa.to_nat) |> fst));
          nfa
        | Ir.SRegRaw (atom, reg) -> Extra.eval_sregraw vars atom reg
        | Ir.SLen (atom, atom') ->
@@ -326,6 +328,10 @@ struct
            ~dest:(Map.find_exn vars atom')
            ~src:(Map.find_exn vars atom)
            ()
+       | Ir.SLenConst specs ->
+         NfaCollection.strlen_const
+           ~alpha
+           (List.map (fun (a, n) -> Map.find_exn vars a, n) specs)
        | _ -> failwith "unexpected due to Arithmetization")
       |> fun nfa ->
       trace_log "Done %a%!" Ir.pp ir;
@@ -466,8 +472,8 @@ struct
   let nfa_for_exponent s var newvar chrob =
     let module Nfa = NfaNat in
     let module NfaCollection = NfaCollectionNat in
-    let bound_res = Config.config.bound_res in
     let segm c =
+      let bound_res = Config.residue_bound c in
       if bound_res >= 0 && bound_res < c
       then (
         Config.bounded_unsat := true;
@@ -602,6 +608,7 @@ struct
   let proof_order return project s nfa order =
     let module Nfa = NfaNat in
     let module NfaCollection = NfaCollectionNat in
+    Config.dyn_reset_budget ();
     let get_deg = Map.find_exn s.vars in
     let rec helper nfa remaining_order model =
       Debug.trace
@@ -945,6 +952,7 @@ struct
             then Map.mem map k
             else decide (fun x -> (not (Set.mem free_atoms (to_exp x))) || good x) k
       in
+      let pinned = ref [] in
       let f =
         f
         |> Ir.map (function
@@ -966,10 +974,12 @@ struct
           | SReg (atom, re) when Map.mem map atom -> Ir.true_
           | SRegRaw (atom, re) when Map.mem map atom -> Ir.true_
           | SLen (atom, atom') when is_exp atom' && filter atom' ->
-            let new_atom = Ir.internal () in
+            (* Pin the known length directly: a fresh var equal to base^v
+               is a v-state constant automaton that blows the product. One
+               joint SLenConst below -- separate chains multiply. *)
             let v = get_val map (get_exp atom') in
-            Ir.land_
-              [ Ir.slen atom new_atom; Ir.eq (Map.singleton new_atom Z.one) (pow2z v) ]
+            pinned := (atom, Z.to_int v) :: !pinned;
+            Ir.true_
           | SLen (atom, atom') when (not (is_exp atom)) && filter atom ->
             let new_atom = Ir.internal () in
             let v = get_val map atom in
@@ -979,6 +989,11 @@ struct
             let v = get_val map atom' in
             Ir.land_ [ Ir.slen atom new_atom; Ir.eq (Map.singleton new_atom Z.one) v ]
           | x -> x)
+      in
+      let f =
+        match !pinned with
+        | [] -> f
+        | pins -> Ir.land_ [ f; Ir.slen_const pins ]
       in
       trace_log "Formula after substituting exponents: %a\n" Ir.pp f;
       let result = f |> Ir.simpl |> Ir.simpl_ineq in
@@ -1052,38 +1067,77 @@ struct
     let sat_if_no_unsupp arg = if had_unsupp then `Unknown else `Sat arg in
     let run_semenov = Ir.collect_vars ir |> Map.keys |> List.exists is_exp in
     if run_semenov
-    then
-      if Config.config.no_model
-      then
-        ir
-        |> eval_semenov
-             (fun _ _ nfa _ -> if NfaNat.run nfa then Some () else None)
-             (fun var nfa -> NfaNat.project [ var ] nfa)
-        |> function
-        | Some _ -> sat_if_no_unsupp (fun () -> Result.error `No_model)
-        | None -> `Unsat
-      else (
-        let res =
+    then (
+      let once () =
+        if Config.config.no_model
+        then
           ir
           |> eval_semenov
-               (fun s order nfa model ->
-                  match
-                    NfaNat.any_path
-                      nfa
-                      (s.vars |> Map.filter_keys ~f:Ir.is_var |> Map.data)
-                  with
-                  | Some path -> Some (s, order, path, model)
-                  | None -> None)
-               (fun _ nfa -> nfa)
-        in
-        begin match res with
-        | None -> if !Config.bounded_unsat then `Unknown else `Unsat
-        | Some (s, order, (model, len), models) ->
-          sat_if_no_unsupp (get_model_semenov ir s order (model, len) models)
-        (* (match get_model_semenov ir s order (model, len) models with
-             | `Cant_get_model -> `Sat (Result.Error `Too_long)
-             | `Ok x -> `Sat (Result.Ok x)) *)
-        end)
+               (fun _ _ nfa _ -> if NfaNat.run nfa then Some () else None)
+               (fun var nfa -> NfaNat.project [ var ] nfa)
+          |> function
+          | Some _ -> sat_if_no_unsupp (fun () -> Result.error `No_model)
+          | None -> if !Config.bounded_unsat then `Gated_unknown else `Unsat
+        else (
+          let res =
+            ir
+            |> eval_semenov
+                 (fun s order nfa model ->
+                    (* Minimize the eliminated exponents first: each layer
+                       re-expands into a path piece exactly that long. *)
+                    let prefer =
+                      List.rev order
+                      |> List.filter_map (function
+                        | Ir.Pow2 v -> Map.find s.vars (Ir.var v)
+                        | _ -> None)
+                    in
+                    match
+                      NfaNat.any_path
+                        ~prefer
+                        nfa
+                        (s.vars |> Map.filter_keys ~f:Ir.is_var |> Map.data)
+                    with
+                    | Some path -> Some (s, order, path, model)
+                    | None -> None)
+                 (fun _ nfa -> nfa)
+          in
+          match res with
+          | None -> if !Config.bounded_unsat then `Gated_unknown else `Unsat
+          | Some (s, order, (model, len), models) ->
+            sat_if_no_unsupp (get_model_semenov ir s order (model, len) models))
+      in
+      let saved_marks = !Config.bounded_unsat in
+      let saved_dyn = Config.config.dyn_bounds in
+      let rec attempt tried =
+        Config.bounded_unsat := false;
+        match once () with
+        | `Gated_unknown when Config.dyn_enabled () && tried < Config.dyn_max_attempts ->
+          if !Config.dyn_scale < 512
+          then (
+            Config.dyn_scale := !Config.dyn_scale * 8;
+            attempt (tried + 1))
+          else
+            Fun.protect
+              ~finally:(fun () -> Config.config.dyn_bounds <- saved_dyn)
+              (fun () ->
+                 Config.config.dyn_bounds <- false;
+                 attempt (tried + 1))
+        | rez ->
+          let truncated = !Config.bounded_unsat in
+          (Config.bounded_unsat
+           := saved_marks
+              ||
+                match rez with
+                | `Sat _ -> false
+                | _ -> truncated);
+          (match rez with
+           | `Gated_unknown -> `Unknown
+           | (`Sat _ | `Unsat | `Unknown) as r -> r)
+      in
+      Config.dyn_scale := 1;
+      Fun.protect
+        ~finally:(fun () -> Config.bounded_unsat := saved_marks || !Config.bounded_unsat)
+        (fun () -> Config.in_dyn_stage (fun () -> attempt 1)))
     else (
       let free_vars = Ir.collect_free ir in
       let ir' = Ir.exists (free_vars |> Set.to_list) ir in
@@ -1420,6 +1474,10 @@ module Msb =
         failwith "string constraints are not supported in EIA mode"
       ;;
 
+      (* Unsigned on purpose: this reads the semenov machinery's raw
+         exponent-block words, which carry no sign symbol. User-facing
+         values go through [int_to_model] / the final signed decode
+         instead. *)
       let nat_model_to_int =
         int_of_path (module NfaO.Bv) ~mode:`Msb z_of_bool_list ?negate_symbol:Option.none
       ;;
@@ -1432,7 +1490,22 @@ module Msb =
       ;;
 
       let nat_model_to_model model = char_to_v '0' :: model
-      let int_to_model n = n |> Utils.to_bits |> Base.List.rev |> fun x -> false :: x
+
+      (* The encode dual of [nat_model_to_int]: sign-symbol-first two's
+         complement. [Utils.to_bits] works on |n|, so a negative value used
+         to encode as its absolute word behind a 0 sign -- x = -1 round-
+         tripped as +1. A negative n is the 1 sign symbol followed by the
+         complement of the bits of [-n - 1]. *)
+      let int_to_model n =
+        if Z.(geq n zero)
+        then n |> Utils.to_bits |> Base.List.rev |> fun x -> false :: x
+        else
+          Z.(-n - one)
+          |> Utils.to_bits
+          |> Base.List.rev
+          |> List.map Stdlib.not
+          |> fun x -> true :: x
+      ;;
     end)
 
 let ( let* ) = Result.bind
@@ -1492,7 +1565,23 @@ let check_sat ir
                 in
                 match Map.find tys k' with
                 | None | Some `Int ->
-                  let v = int_of_path (module Nfa.Bv) z_of_bool_list v in
+                  (* Msb integer tracks are sign-symbol-first two's
+                     complement, the same convention the [negate_symbol]
+                     callers above decode; reading the sign symbol as a
+                     value bit returned negative models sign-dropped
+                     (x = -4 printed as 4). Lsb goes through [to_nat], so
+                     its words are plain naturals. The empty word is 0. *)
+                  let v =
+                    match Config.config.mode, v with
+                    | _, [] -> Z.zero
+                    | `Msb, v ->
+                      int_of_path
+                        (module Nfa.Bv)
+                        z_of_bool_list
+                        ~negate_symbol:Stdlib.not
+                        v
+                    | `Lsb, v -> int_of_path (module Nfa.Bv) z_of_bool_list v
+                  in
                   let v =
                     match k with
                     | Ir.Var _ -> v
