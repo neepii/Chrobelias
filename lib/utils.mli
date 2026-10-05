@@ -15,3 +15,4 @@ val powerset : 'a list -> 'a list list
 val powerset_seq : 'a list -> 'a list Seq.t
 val strings_of_len : int -> string list -> string list
 val with_extra_char : char Set.t -> char list
+val gensym : ?prefix:string -> unit -> string
