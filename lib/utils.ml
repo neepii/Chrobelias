@@ -104,3 +104,10 @@ let with_extra_char alpha =
   in
   Set.union alpha extra_char |> Set.to_list
 ;;
+
+let gensym =
+  let n = ref 0 in
+  fun ?(prefix = "eee") () ->
+    incr n;
+    Printf.sprintf "%s%d" prefix !n
+;;
