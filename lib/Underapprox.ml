@@ -109,6 +109,7 @@ let make_collector () =
     let mod_ x _ = x
     let true_ = empty
     let false_ = empty
+    let pred _ = empty
 
     (* phormulas  *)
     let in_re _ _ = failwith __FILE__
@@ -151,7 +152,7 @@ let apply_symantics (type a) (module S : SYM with type repr = a) =
     | Lnot x -> S.not (helper x)
     | True -> S.true_
     | Eia e -> helper_eia e
-    | Pred s -> assert false
+    | Pred s -> S.pred s
     | Exists (vs, ph) ->
       let vs =
         List.filter_map
@@ -254,6 +255,12 @@ let check bound ast =
         let n, s_bound = List.length interestring_vars, semenov_bound bound ast in
         if Z.(pow (of_int s_bound) n < of_int Config.max_under_const)
         then s_bound
+        else if n > 8
+        then
+          (* With this many exponent variables even a bounded sample of the
+             choice space is noise, and every candidate re-encodes the whole
+             formula into Z3 -- skip straight to the exact engines. *)
+          -1
         else Config.config.under_approx)
     in
     let module Map = Base.Map.Poly in
@@ -273,6 +280,11 @@ let check bound ast =
         (Seq.return Map.empty)
         interestring_vars
     in
+    (* The space is enumerated lazily and the first Sat wins, so an
+       oversized space still deserves a try -- but a bounded one: with a
+       dozen exponent variables the full (bound+1)^n grind is millions of Z3
+       calls and starves the rest of the pipeline. *)
+    let all_choices = Seq.take (Stdlib.( / ) Config.max_under_const 10) all_choices in
     let exception Early of env in
     let exception Early_Unsat in
     (* Loop-invariant: the choice only contributes the [key = data] conjuncts,
@@ -312,6 +324,15 @@ let check bound ast =
                        match k.name, v with
                        | Smtml.Symbol.Simple s, Smtml.Value.Int n
                          when Bool.not (Map.mem acc s) -> Map.add_exn acc ~key:s ~data:n
+                       | ( Smtml.Symbol.Simple s
+                         , ((Smtml.Value.True | Smtml.Value.False) as b) )
+                         when Bool.not (Map.mem acc s) ->
+                         let data =
+                           match b with
+                           | Smtml.Value.True -> Z.one
+                           | _ -> Z.zero
+                         in
+                         Map.add_exn acc ~key:s ~data
                        | _ -> acc)
                     (Smtml.Z3_mappings.values_of_model m)
                     (Map.map env ~f:Z.of_int)

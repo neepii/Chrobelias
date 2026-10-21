@@ -1,7 +1,7 @@
 module Map = Base.Map.Poly
 
-type t = (string, [ `Int of Z.t | `Str of string ]) Map.t
-type tys = (string, [ `Int | `Str ]) Map.t
+type t = (string, [ `Int of Z.t | `Str of string | `Bool of bool ]) Map.t
+type tys = (string, [ `Int | `Str | `Bool ]) Map.t
 
 let pp ppf m =
   let open Format in
@@ -15,6 +15,7 @@ let pp ppf m =
       match data with
       | `Int z -> fprintf ppf "  @[(define-fun %s () Int\n    %a)@]" key Z.pp_print z
       | `Str s -> fprintf ppf "  @[(define-fun %s () String\n    \"%s\")@]" key s
+      | `Bool b -> fprintf ppf "  @[(define-fun %s () Bool\n    %b)@]" key b
     end
     else ());
   fprintf ppf "\n)@]"

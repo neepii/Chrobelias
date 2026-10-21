@@ -75,14 +75,31 @@ let rec fold_until_sat f acc seq =
      | Seq.Cons (x, rest) -> fold_until_sat f (f acc x) rest)
 ;;
 
-let construct_model tys env model regexes =
+let construct_model (tys : Model.tys) env model regexes =
   let module NfaS = Nfa.String in
   let join_int_model prefix m =
     let open Ast in
     Debug.trace "Model" "Prefix %a\n%!" (Env.pp ~title:"prefix") prefix;
     Debug.trace "Model" "Model %s\n%!" (Model.to_string m);
+    let has_unfolded_pow : type a. a Eia.term -> bool =
+      let open Ast.Eia in
+      fun term ->
+        fold_term
+          (fun acc -> function
+             | Pow (Const _, Const _) -> true
+             | _ -> acc)
+          (fun acc _ -> acc)
+          false
+          term
+    in
     let prefix =
-      let shrink_ir_model = Map.map_keys_exn m ~f:(fun s -> Any_atom (Ast.var s Ast.I)) in
+      let shrink_ir_model =
+        Map.filter_map m ~f:(function
+          | `Int z -> Some (`Int z)
+          | `Str s -> Some (`Str s)
+          | `Bool _ -> None)
+        |> Map.map_keys_exn ~f:(fun s -> Any_atom (Ast.var s Ast.I))
+      in
       Env.enrich prefix shrink_ir_model
     in
     let rec seek prefix key =
@@ -93,7 +110,7 @@ let construct_model tys env model regexes =
          | Eia.Str_const s -> Option.some (`Str s)
          | Eia.Atom (Var (v, _)) -> seek prefix v
          | Eia.Len (Eia.Atom (Var (v, _))) -> seek prefix ("strlen" ^ v)
-         | _ -> None)
+         | term -> if has_unfolded_pow term then raise Too_long_model else None)
       | None ->
         (match Env.lookup_string key prefix with
          | Some str ->
@@ -101,7 +118,7 @@ let construct_model tys env model regexes =
             | Eia.Const c -> Option.some (`Int c)
             | Eia.Str_const s -> Option.some (`Str s)
             | Eia.Atom (Var (v, _)) -> seek prefix v
-            | _ -> None)
+            | term -> if has_unfolded_pow term then raise Too_long_model else None)
          | None -> None)
     in
     let rec saturate env =
@@ -158,7 +175,7 @@ let construct_model tys env model regexes =
             else (
               try Z.to_int c with
               | Z.Overflow -> raise Too_long_model)
-          | _ -> assert false
+          | `Str _ | `Bool _ -> assert false
         in
         if Map.mem model string_var
         then None
@@ -185,6 +202,7 @@ let construct_model tys env model regexes =
         let data =
           match data with
           | `Str c -> `Str c
+          | `Bool b -> `Bool b
           | `Int d ->
             (match Map.find tys key with
              | Some `Str ->
@@ -202,6 +220,7 @@ let construct_model tys env model regexes =
                    List.nth l 0 |> List.rev |> List.to_seq |> String.of_seq)
                in
                `Str model
+             | Some `Bool -> `Bool Z.(d <> zero)
              | Some `Int | None -> `Int d)
         in
         let result =
@@ -221,6 +240,7 @@ let construct_model tys env model regexes =
             in
             `Str str
           | `Int d -> `Int d
+          | `Bool b -> `Bool b
         in
         Some (key, result))
     |> Map.of_alist_exn
@@ -260,7 +280,7 @@ let construct_model tys env model regexes =
         then (
           match data with
           | `Str -> Env.extend_string_exn env key (Ast.Eia.Str_const "")
-          | `Int -> Env.extend_int_exn env key (Ast.Eia.Const Z.zero))
+          | `Int | `Bool -> Env.extend_int_exn env key (Ast.Eia.Const Z.zero))
         else env)
       tys
   in
@@ -294,7 +314,8 @@ let construct_model tys env model regexes =
         | Some (`Str s), `Str -> Map.add_exn acc ~key ~data:(`Str s)
         | Some (`Int c), `Int -> Map.add_exn acc ~key ~data:(`Int c)
         | Some (`Int c), `Str -> Map.add_exn acc ~key ~data:(`Str (Z.to_string c))
-        | Some (`Str _), `Int | None, _ -> acc))
+        | Some (`Int c), `Bool -> Map.add_exn acc ~key ~data:(`Bool Z.(c <> zero))
+        | Some (`Str _), (`Int | `Bool) | None, _ -> acc))
     ~init:(Map.filter_keys ~f:(Map.mem tys) string_model)
     tys
 ;;
@@ -319,6 +340,28 @@ let calculate_model tys env model regexes =
 ;;
 
 let print_model model = Format.printf "%s\n%!" (Model.to_string model)
+
+(* [-huge n] is a statement about what gets printed: no string longer than [n]
+   characters and no integer whose decimal expansion runs past [n] digits. The
+   measurement belongs on the finished model rather than on the constraints the
+   re-solve adds, because those are derived from the formula and can land above
+   [n] -- that is how a 101-character model came back under [-huge 100]. Names
+   [Model.pp] hides are not printed, so they are not measured. *)
+let model_within_len len model =
+  let decimal_fits z =
+    let z = Z.abs z in
+    (* A decimal expansion is never longer than the bit length, so anything
+       that fits in [len] bits is in range without building [10 ** len]. *)
+    Z.numbits z <= len || Z.lt z (Z.pow (Z.of_int 10) len)
+  in
+  Map.for_alli model ~f:(fun ~key ~data ->
+    String.starts_with ~prefix:"%" key
+    ||
+      match data with
+      | `Int z -> decimal_fits z
+      | `Str s -> String.length s <= len
+      | `Bool _ -> true)
+;;
 
 let report_result ?(verbose = false) rez =
   let check_answer () =
@@ -436,22 +479,37 @@ let dpll check_sat ?(verbose = false) ast =
   let bool_to_eia s =
     match Map.find !bool_map s with
     | Some eia -> eia
-    | None ->
-      Format.kasprintf
-        failwith
-        "Unexpected state: predicate %s is in the original definition"
-        s
+    | None -> Ast.pred s
   in
+  let is_theory_atom s = Map.mem !bool_map s in
   let of_bool_model ~map z3_model =
     Hashtbl.fold
       (fun sym value acc ->
-         match value with
-         | Smtml.Value.True -> map (Fe.sym_to_pred sym) :: acc
-         | Smtml.Value.False -> Ast.lnot (map (Fe.sym_to_pred sym)) :: acc
-         | _ -> acc)
+         let s = Fe.sym_to_pred sym in
+         if not (is_theory_atom s)
+         then acc
+         else (
+           match value with
+           | Smtml.Value.True -> map s :: acc
+           | Smtml.Value.False -> Ast.lnot (map s) :: acc
+           | _ -> acc))
       z3_model
       []
     |> Ast.land_
+  in
+  let bool_values z3_model =
+    Hashtbl.fold
+      (fun sym value acc ->
+         let s = Fe.sym_to_pred sym in
+         if is_theory_atom s
+         then acc
+         else (
+           match value with
+           | Smtml.Value.True -> (s, true) :: acc
+           | Smtml.Value.False -> (s, false) :: acc
+           | _ -> acc))
+      z3_model
+      []
   in
   let unsat_reason = ref "bool" in
   let can_be_unk = ref false in
@@ -467,9 +525,16 @@ let dpll check_sat ?(verbose = false) ast =
       let candidate = of_bool_model ~map:bool_to_eia model in
       Debug.trace "DPLL" "Trying %a%!" Ast.pp_smtlib2 candidate;
       (match check_sat candidate with
-       | Sat (s, _) as result ->
+       | Sat (s, (sat_ast, env, get_model, regexes)) ->
          report_result ~verbose (`Sat s);
-         result
+         let bools = bool_values model in
+         let get_model tys =
+           Result.map
+             (fun m ->
+                List.fold_left (fun m (s, b) -> Map.set m ~key:s ~data:(`Bool b)) m bools)
+             (get_model tys)
+         in
+         Sat (s, (sat_ast, env, get_model, regexes))
        | Unsat (s, core) ->
          (*Debug.trace "DPLL" "Unsat core: %a\n%!" Ast.pp_smtlib2 core;*)
          unsat_reason := reason s !unsat_reason;
@@ -510,16 +575,56 @@ let dpll check_sat ?(verbose = false) ast =
        ())
 ;;
 
+let dnf check_sat ast =
+  let can_be_unk = ref false in
+  let unsat_reason = ref "bool" in
+  match
+    Ast.to_dnf_seq ast
+    |> Seq.find_map (fun conj ->
+      match check_sat conj with
+      | Sat _ as rez -> Some rez
+      | Unsat (s, _) ->
+        unsat_reason := reason s !unsat_reason;
+        None
+      | Unknown _ ->
+        can_be_unk := true;
+        None)
+  with
+  | Some rez -> rez
+  | None ->
+    if !can_be_unk then unknown Ast.true_ Env.empty else unsat !unsat_reason Ast.true_
+;;
+
+let solve_bool check_sat ast =
+  if config.dpll then dpll check_sat ~verbose:false ast else dnf check_sat ast
+;;
+
 let rec check_sat ?(verbose = false) (tys : Model.tys) ast : rez =
   let report_result2 s = report_result ~verbose s in
+  (* What an unknown answer reports: the NFA Solver's rejection message or
+     the NIA check giving up, whichever happened last; plain "nfa"
+     otherwise. *)
+  let unknown_reason = ref "nfa" in
+  (* A DPLL(T) or DNF candidate whose automaton outgrows the size limit is
+     undecided; the search goes on with the other candidates. *)
+  let candidate check ast =
+    try check ast with
+    | Nfa.Too_big_nfa ->
+      unknown_reason := "too big nfa during the computations";
+      unknown ast Env.empty
+  in
   let check_nfa_sat ast e =
     trace_log "Checking nfa sat (ast = %a)\n%!" Ast.pp_smtlib2 ast;
     Debug.trace "NFA" "Ast to NFA Solver: %a" Ast.pp_smtlib2 ast;
     match Me.ir_of_ast e ast with
     | Ok ir ->
+      if config.dump_ir then Format.printf "; translated IR\n%a\n%!" Ir.pp_smtlib2 ir;
       let ir = ir |> Ir.simpl |> Ir.simpl_ineq in
       let e, ir = if config.simpl_mono then Ir.simpl_monotonicty e ir else e, ir in
       let ir = if config.simpl_alpha then Simpl_alpha.simplify ir else ir in
+      let ir =
+        if config.simpl_quantifier_elim then Ir.simpl_quantifiers ir |> Ir.simpl else ir
+      in
       (match ir with
        | Lib.Ir.True -> sat "simpl" ast ~env:e
        | Lnot True -> unsat "simpl" ast
@@ -532,8 +637,9 @@ let rec check_sat ?(verbose = false) (tys : Model.tys) ast : rez =
           | `Unsat -> unsat "nfa" ast
           | `Unknown _ir -> unknown ast e))
     | Error s ->
-      report_result2 (`Unknown (Format.sprintf "(nfa) %s" s));
-      exit 0
+      trace_log "NFA Solver rejects the formula: %s\n%!" s;
+      unknown_reason := Format.sprintf "(nfa) %s" s;
+      unknown ast e
   in
   let ( <+> ) =
     fun rez f ->
@@ -596,8 +702,8 @@ let rec check_sat ?(verbose = false) (tys : Model.tys) ast : rez =
           | `Sat env -> sat "nia" ast ~env
           | `Unsat -> unsat "nia" ast
           | `Unknown ->
-            report_result2 (`Unknown "nia");
-            exit 0)
+            unknown_reason := "nia";
+            unknown ast e)
         else unknown ast e
     in
     match apporx_rez with
@@ -700,7 +806,7 @@ let rec check_sat ?(verbose = false) (tys : Model.tys) ast : rez =
                  ast
                  (Env.pp ~title:"")
                  env;
-               let orig_ast = ast in
+               let orig_ast = Ast.land_ (ast :: Env.to_eqs env) in
                let arithmetized_asts = SimplII.arithmetize str_vars ast env in
                fold_until_sat
                  (fun acc (ast, e, regexes) ->
@@ -724,51 +830,51 @@ let rec check_sat ?(verbose = false) (tys : Model.tys) ast : rez =
                            match get_model tys with
                            | Result.Ok model ->
                              let model = construct_model tys env model regexes in
-                             begin
-                               let ( let* ) = Option.bind in
-                               match
-                                 List.fold_left
-                                   (fun acc post ->
-                                      let* acc = acc in
-                                      match
-                                        post model orig_ast regexes (fun ast ->
-                                          match (check_sat tys) ast with
-                                          | Sat (_, (_, env, get_model, regexes)) ->
-                                            `Sat
-                                              (fun () ->
-                                                begin
-                                                  let intm_model =
-                                                    calculate_model
-                                                      tys
-                                                      env
-                                                      (get_model tys |> Result.get_ok)
-                                                      regexes
-                                                  in
-                                                  intm_model
-                                                end)
-                                          | _ -> `Unknown)
-                                      with
-                                      | `Sat get_model ->
-                                        Some
-                                          (fun () ->
-                                            let model1 = acc () in
-                                            let model2 = get_model () in
-                                            (* Can be not disjoint. *)
-                                            merge_models model1 model2)
-                                      | `Unknown -> None)
-                                   (Some (fun () -> Map.empty))
-                                   post
-                               with
-                               | Some get_model' ->
-                                 let get_model tys =
-                                   let model1 = get_model tys |> Result.get_ok in
-                                   let model2 = get_model' () in
-                                   Result.ok (merge_models model1 model2)
-                                 in
-                                 sat s ast ~env ~get_model ~regexes
-                               | None ->
-                                 can_be_unk := true;
-                                 unknown ast Env.empty
+                             let check ast =
+                               match check_sat tys ast with
+                               | Sat (_, (_, env, get_model, regexes)) ->
+                                 `Sat
+                                   (fun () ->
+                                     calculate_model
+                                       tys
+                                       env
+                                       (get_model tys |> Result.get_ok)
+                                       regexes)
+                               | _ -> `Unknown
+                             in
+                             let ( let* ) = Option.bind in
+                             let witnesses =
+                               List.fold_left
+                                 (fun acc post ->
+                                    let* acc = acc in
+                                    match
+                                      post
+                                        model
+                                        (Ast.land_ (orig_ast :: acc))
+                                        regexes
+                                        check
+                                    with
+                                    | `Sat w -> Some (w :: acc)
+                                    | `Unknown -> None)
+                                 (Some [])
+                                 post
+                             in
+                             begin match
+                               Option.map
+                                 (fun ws -> check (Ast.land_ (orig_ast :: ws)))
+                                 witnesses
+                             with
+                             | Some (`Sat get_model') ->
+                               let get_model tys =
+                                 Result.ok
+                                   (merge_models
+                                      (get_model' ())
+                                      (get_model tys |> Result.get_ok))
+                               in
+                               sat s ast ~env ~get_model ~regexes
+                             | Some `Unknown | None ->
+                               can_be_unk := true;
+                               unknown ast Env.empty
                              end
                            | Result.Error _ ->
                              can_be_unk := true;
@@ -914,7 +1020,8 @@ let rec check_sat ?(verbose = false) (tys : Model.tys) ast : rez =
         aux z3_light env
       in
       let light_dpll = if config.light_dpll then light_dpll else Fun.id in
-      match dpll (light_dpll arithmetize_and_check env) ~verbose:false ast with
+      let theory = candidate (light_dpll arithmetize_and_check env) in
+      match solve_bool theory ast with
       | Sat _ as rez -> rez
       | Unknown _ as rez -> rez
       | Unsat _ as rez when not !can_be_unk -> rez
@@ -955,7 +1062,7 @@ let rec check_sat ?(verbose = false) (tys : Model.tys) ast : rez =
                 begin if Seq.is_empty seq_of_variants
                 then
                   handle (check_string_sat e ast) (fun () ->
-                    report_result2 (`Unknown "nfa");
+                    report_result2 (`Unknown !unknown_reason);
                     unknown ast Env.empty)
                 else
                   (* Under-approximations first: cheap, they can only answer [Sat],
@@ -996,10 +1103,7 @@ let rec check_sat ?(verbose = false) (tys : Model.tys) ast : rez =
                     | None, true ->
                       if !Config.bounded_unsat
                       then (
-                        trace_log
-                          "Can't decide with bres=%d and bstates=%d\n%!"
-                          config.bound_res
-                          config.bound_states;
+                        trace_log "Can't decide under the dynamic bounds\n%!";
                         raise Lics_Underapprox_unsuccessful)
                       else (
                         report_result2 (`Unknown "");
@@ -1016,10 +1120,241 @@ let rec check_sat ?(verbose = false) (tys : Model.tys) ast : rez =
         let s = "under str" in
         report_result2 (`Sat s);
         sat s ast ~env)
-    else
-      handle (check_eia_sat ast Env.empty) (fun () ->
-        report_result2 (`Unknown "nfa");
-        unknown ast Env.empty)
+    else (
+      (* Standard [**] semantics: the engine's partial Pow relation is exact
+         only on nonnegative exponents, so powers it cannot express are
+         totalized by [std_exp_split] into guarded sign/parity disjunctions,
+         and the formula is decided on that split form -- sound by
+         construction. Formulas the split leaves unchanged (all exponents
+         provably nonnegative, or no powers at all) go straight through the
+         regular pipeline. *)
+      let check_eia_sat_bool ast e =
+        let boolean =
+          (not (Ast.is_conjunct ast))
+          && (not
+                (Ast.forsome
+                   (function
+                     | Ast.Exists _ | Ast.Unsupp _ -> true
+                     | _ -> false)
+                   ast))
+          && config.stop_after = `Solving
+          && (not config.dump_pre_simpl)
+          && not config.dump_simpl
+        in
+        if boolean
+        then solve_bool (candidate (fun ast -> check_eia_sat ast e)) ast
+        else check_eia_sat ast e
+      in
+      let ast_split = SimplII.std_exp_split ast in
+      let fallback ast =
+        fun () ->
+        report_result2 (`Unknown !unknown_reason);
+        unknown ast Env.empty
+      in
+      let confirmed = function
+        | Sat (_, (_, env, get_model, _)) ->
+          let pins = Hashtbl.create 8 in
+          (* Variables eliminated by substitution are bound to *terms* in
+             the env (e.g. y := 2^z * (1 + 2^u)); collect those separately
+             and evaluate them on demand, or the evaluator would default a
+             determined variable to 0 and refute the genuine model. *)
+          let defs : (string, Z.t Ast.Eia.term) Hashtbl.t = Hashtbl.create 8 in
+          Env.fold env ~init:() ~f:(fun ~key ~data () ->
+            match data with
+            | Ast.TT (Ast.I, Ast.Eia.Const c) -> Hashtbl.replace pins key c
+            | Ast.TT (Ast.I, t) -> Hashtbl.replace defs key t
+            | _ -> ());
+          (match get_model tys with
+           | Result.Ok model ->
+             Map.iteri model ~f:(fun ~key ~data ->
+               match data with
+               | `Int c -> Hashtbl.replace pins key c
+               | `Str _ | `Bool _ -> ())
+           | Result.Error _ -> ());
+          let visiting = Hashtbl.create 8 in
+          let rec term : Z.t Ast.Eia.term -> Z.t option = function
+            | Ast.Eia.Const c -> Some c
+            | Ast.Eia.Atom (Ast.Var (v, Ast.I)) ->
+              (match Hashtbl.find_opt pins v with
+               | Some c -> Some c
+               | None ->
+                 let fallback = Z.zero in
+                 (match Hashtbl.find_opt defs v with
+                  | Some t when not (Hashtbl.mem visiting v) ->
+                    Hashtbl.replace visiting v ();
+                    let r = term t in
+                    Hashtbl.remove visiting v;
+                    let c = Option.value ~default:fallback r in
+                    Hashtbl.replace pins v c;
+                    Some c
+                  | _ -> Some fallback))
+            | Ast.Eia.Add ts ->
+              List.fold_left
+                (fun acc t ->
+                   match acc, term t with
+                   | Some a, Some b -> Some (Z.add a b)
+                   | _ -> None)
+                (Some Z.zero)
+                ts
+            | Ast.Eia.Mul ts ->
+              List.fold_left
+                (fun acc t ->
+                   match acc, term t with
+                   | Some a, Some b -> Some (Z.mul a b)
+                   | _ -> None)
+                (Some Z.one)
+                ts
+            | Ast.Eia.Mod (t, z) -> Option.map (fun v -> Z.erem v z) (term t)
+            | Ast.Eia.Pow (b, e) ->
+              (match term b, term e with
+               | Some b, Some e ->
+                 if Z.(geq e zero)
+                 then
+                   if Z.(gt e (of_int 131072)) && Z.(gt (abs b) one)
+                   then None
+                   else Some (Utils.powz ~base:b e)
+                 else if Z.(equal (abs b) one)
+                 then Some (if Z.is_even e then Z.one else b)
+                 else Some Z.zero
+               | _ -> None)
+            | _ -> None
+          in
+          let rec ph : Ast.t -> bool option = function
+            | Ast.True -> Some true
+            | Ast.Land xs ->
+              List.fold_left
+                (fun acc x ->
+                   match acc, ph x with
+                   | Some a, Some b -> Some (a && b)
+                   | _ -> None)
+                (Some true)
+                xs
+            | Ast.Lor xs ->
+              List.fold_left
+                (fun acc x ->
+                   match acc, ph x with
+                   | Some a, Some b -> Some (a || b)
+                   | _ -> None)
+                (Some false)
+                xs
+            | Ast.Lnot x -> Option.map not (ph x)
+            | Ast.Eia (Ast.Eia.Eq (l, r, Ast.I)) ->
+              (match term l, term r with
+               | Some l, Some r -> Some (Z.equal l r)
+               | _ -> None)
+            | Ast.Eia (Ast.Eia.Neq (l, r, Ast.I)) ->
+              (match term l, term r with
+               | Some l, Some r -> Some (not (Z.equal l r))
+               | _ -> None)
+            | Ast.Eia (Ast.Eia.Leq (l, r)) ->
+              (match term l, term r with
+               | Some l, Some r -> Some (Z.leq l r)
+               | _ -> None)
+            | _ -> None
+          in
+          let rez = ph ast in
+          if Sys.getenv_opt "CHRO_CONFIRM_DEBUG" <> None
+          then
+            Printf.eprintf
+              "[confirm] pins=%s ph=%s\n%!"
+              (Hashtbl.fold (fun k v acc -> acc ^ k ^ "=" ^ Z.to_string v ^ " ") pins "")
+              (match rez with
+               | Some true -> "true"
+               | Some false -> "false"
+               | None -> "none");
+          rez = Some true
+        | Unsat _ | Unknown _ -> false
+      in
+      let pow_free ph =
+        not
+          (Ast.fold
+             (fun acc -> function
+                | Ast.Eia eia ->
+                  acc
+                  || Ast.Eia.fold2
+                       (fun acc -> function
+                          | Ast.Eia.Pow _ -> true
+                          | _ -> acc)
+                       (fun acc _ -> acc)
+                       false
+                       eia
+                | _ -> acc)
+             false
+             ph)
+      in
+      let solve_split () =
+        let members =
+          match ast_split with
+          | Ast.Land xs -> xs
+          | ph -> [ ph ]
+        in
+        let defs, core =
+          List.partition
+            (function
+              | Ast.Lor _ -> true
+              | _ -> false)
+            members
+        in
+        let branch_count =
+          List.fold_left
+            (fun acc -> function
+               | Ast.Lor arms when acc <= 16 -> acc * List.length arms
+               | _ -> acc)
+            1
+            defs
+        in
+        let quick =
+          (* Also size-gated: a branch conjunction goes through the full
+             simplifier fixpoint, which on CHC-sized inputs costs seconds
+             per branch. *)
+          if List.is_empty defs || branch_count > 16 || List.length core > 40
+          then None
+          else (
+            let branches =
+              List.fold_left
+                (fun acc -> function
+                   | Ast.Lor arms ->
+                     List.concat_map
+                       (fun sel -> List.map (fun arm -> arm :: sel) arms)
+                       acc
+                   | _ -> acc)
+                [ [] ]
+                defs
+            in
+            (* Branches are scanned with early exits: a Sat branch is a
+               model, and only an all-Unsat scan proves unsat -- so the
+               first undecided branch aborts the enumeration rather than
+               burning a full simplifier run per remaining branch. *)
+            let rec scan = function
+              | [] -> Some (unsat "presimpl int" ast_split)
+              | sel :: rest ->
+                (match
+                   SimplII.run_basic_simplify ~minimize:false (Ast.land_ (core @ sel))
+                 with
+                 | `Sat env -> Some (sat "presimpl int" ast_split ~env)
+                 | `Unsat _ -> scan rest
+                 | `Unknown _ ->
+                   let branch = Ast.land_ (core @ sel) in
+                   if not (SimplII.engine_pows_only branch)
+                   then None
+                   else (
+                     match
+                       try Some (check_eia_sat branch Env.empty) with
+                       | _ -> None
+                     with
+                     | Some (Sat _ as rez) when confirmed rez -> Some rez
+                     | Some (Unsat (_, ucore)) when pow_free ucore -> scan rest
+                     | _ -> None))
+            in
+            scan branches)
+        in
+        match quick with
+        | Some rez -> handle rez (fallback ast_split)
+        | None -> handle (check_eia_sat ast_split Env.empty) (fallback ast_split)
+      in
+      if Stdlib.compare ast ast_split = 0
+      then handle (check_eia_sat_bool ast Env.empty) (fallback ast)
+      else solve_split ())
   with
   | Lics_Underapprox_unsuccessful -> raise Lics_Underapprox_unsuccessful
   | Nfa.Too_big_nfa ->
@@ -1043,6 +1378,7 @@ let check_model tys (ast : Ast.t) (model : Model.t) =
           match data with
           | `Int c -> eia (Eia.eq (Eia.atom (var key I)) (Ast.Eia.const c) I)
           | `Str c -> eia (Eia.eq (Eia.atom (var key S)) (Ast.Eia.str_const c) S)
+          | `Bool b -> if b then pred key else lnot (pred key)
         in
         Ast.land_ [ ast'; ast ])
       model
@@ -1096,6 +1432,30 @@ let () =
       | Sat (_, (_, env, get_model, regexes)) ->
         sat_found := true;
         let tys = merge_tys state in
+        (* Never bound the retry below a length the formula itself demands,
+           or the re-solve is unsat by construction. *)
+        let retry_len =
+          let floor =
+            Ast.fold
+              (fun acc -> function
+                 | Ast.Eia (Ast.Eia.Leq (Ast.Eia.Const c, Ast.Eia.Len _)) -> Z.max acc c
+                 | Ast.Eia
+                     (Ast.Eia.Leq
+                        ( Ast.Eia.Add
+                            [ Ast.Eia.Const c
+                            ; Ast.Eia.Mul [ Ast.Eia.Const m; Ast.Eia.Len _ ]
+                            ]
+                        , Ast.Eia.Const z ))
+                   when Z.(lt m zero) -> Z.max acc (Z.cdiv (Z.sub c z) (Z.neg m))
+                 | _ -> acc)
+              Z.zero
+              ast
+          in
+          let floor = Z.to_int (Z.min floor (Z.of_int 100_000)) in
+          max
+            (Config.huge_const_for_model ())
+            ((floor * 8) + Config.huge_const_for_model ())
+        in
         let rec shrink_model ?len () =
           let attempt, len =
             if Option.is_some len then 2, Option.get len else 1, Config.huge_path ()
@@ -1114,7 +1474,8 @@ let () =
                        (Atom (Var (v, I)))
                        (Const
                           Z.(pow (Z.of_int !Lib.Config.base) (Lib.Config.huge_const ())))))
-                :: acc)
+                :: acc
+              | _, `Bool -> acc)
             |> Lib.Ast.land_
           in
           trace_log "Shrinked AST: @[%a@]\n%!" Ast.pp_smtlib2 shrinked_ast;
@@ -1127,19 +1488,24 @@ let () =
                 (match get_model tys with
                  | Result.Ok model ->
                    let model = calculate_model tys env model regexes in
+                   if (not noprint) && not (model_within_len (Config.huge_path ()) model)
+                   then raise Too_long_model;
                    print_model model;
                    if config.check_model then check_model tys ast model else ()
                  | Result.Error `Too_long -> printf "no short model\n%!"
                  | Result.Error `No_model -> assert false)
           with
           | Lics_Underapprox_unsuccessful ->
-            config.bound_res <- -1;
-            config.bound_states <- -1;
-            shrink_model ~len:(Config.huge_const_for_model ()) ()
+            config.dyn_bounds <- false;
+            shrink_model ~len:retry_len ()
           | Nfa.Too_big_nfa ->
             if attempt == 1
-            then shrink_model ~len:(Config.huge_const_for_model ()) ()
+            then shrink_model ~len:retry_len ()
             else printf "no short model found (nfa)\n%!"
+          | Too_long_model | Solver.Too_long_model ->
+            if attempt == 1
+            then shrink_model ~len:retry_len ()
+            else printf "no short model\n%!"
         in
         let () =
           try
@@ -1148,6 +1514,8 @@ let () =
                 get_model tys
                 |> Result.map (fun model ->
                   let model = calculate_model tys env model regexes in
+                  if (not noprint) && not (model_within_len (Config.huge_path ()) model)
+                  then raise Too_long_model;
                   print_model model;
                   if config.check_model then check_model tys ast model else ())
               with
@@ -1157,7 +1525,7 @@ let () =
             | Result.Error `Too_long -> shrink_model ()
             | Result.Error `No_model -> Format.printf "no model mode\n%!"
           with
-          | Nfa.Too_big_nfa -> shrink_model ~len:(Config.huge_const_for_model ()) ()
+          | Nfa.Too_big_nfa -> shrink_model ~len:retry_len ()
         in
         ()
     in
@@ -1170,6 +1538,7 @@ let () =
         match sort with
         | "Int" -> Map.set ~key:id ~data:`Int state.tys
         | "String" -> Map.set ~key:id ~data:`Str state.tys
+        | "Bool" -> Map.set ~key:id ~data:`Bool state.tys
         | _ -> state.tys
       in
       { state with tys }
@@ -1217,8 +1586,7 @@ let () =
          { state with last_result = Some rez }
        with
        | Lics_Underapprox_unsuccessful ->
-         config.bound_res <- -1;
-         config.bound_states <- -1;
+         config.dyn_bounds <- false;
          Config.bounded_unsat := false;
          let rez = check_sat ~verbose:true state.tys ast in
          if config.check_model then get_model ~noprint:true ast rez;
@@ -1297,7 +1665,51 @@ let () =
     in
     ()
   in
-  if not config.parallel
+  let str_vars_present, nielsen_applicable =
+    match f with
+    | Error _ -> true, true
+    | Ok cmds ->
+      (try
+         let tys =
+           List.fold_left
+             (fun tys cmd ->
+                match cmd with
+                | Smtml.Ast.Declare_const { id; sort; _ }
+                | Smtml.Ast.Declare_fun { id; sort; args = [] } ->
+                  let id = Smtml.Symbol.to_string id in
+                  (match Smtml.Symbol.to_string sort with
+                   | "Int" -> Map.set ~key:id ~data:`Int tys
+                   | "String" -> Map.set ~key:id ~data:`Str tys
+                   | "Bool" -> Map.set ~key:id ~data:`Bool tys
+                   | _ -> tys)
+                | _ -> tys)
+             Map.empty
+             cmds
+         in
+         let asts =
+           List.filter_map
+             (function
+               | Smtml.Ast.Assert e -> Some (Fe.to_ast tys e)
+               | _ -> None)
+             cmds
+         in
+         ( List.exists (fun ast -> Ast.get_str_vars ast <> []) asts
+         , List.exists
+             (Ast.forsome (function
+                | Ast.Eia (Ast.Eia.Eq (_, _, Ast.S) as eia) ->
+                  Ast.Eia.fold2
+                    (fun acc _ -> acc)
+                    (fun acc -> function
+                       | Ast.Eia.Concat _ -> true
+                       | _ -> acc)
+                    false
+                    eia
+                | _ -> false))
+             asts )
+       with
+       | _ -> true, true)
+  in
+  if (not config.parallel) || not str_vars_present
   then solve_all ()
   else (
     (* Run both strategies at once and keep the first definitive answer.
@@ -1330,6 +1742,11 @@ let () =
             config.nielsen <- true;
             deep_under () )
       ]
+    in
+    let strategies =
+      if nielsen_applicable
+      then strategies
+      else List.filter (fun (name, _) -> not (String.equal name "nielsen")) strategies
     in
     let children =
       List.map

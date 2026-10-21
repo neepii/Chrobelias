@@ -621,7 +621,7 @@ let ir_of_ast env ast =
        | Unsupported_constraint s -> return (Ir.Unsupp s))
     | Unsupp (`Msg (s, _)) -> return (Ir.Unsupp s)
     | Unsupp (`Check _) -> return Ir.true_
-    | Pred s -> failf "Unexpected %s" s
+    | Pred s -> return (Ir.Unsupp s)
   in
   (*let ast =
     Env.fold
@@ -684,7 +684,33 @@ let rec eia_of_ir : Ir.t -> Ast.t =
        eia (eq (mod_ lhs m) (const (Z.erem c m)) I))
   | Exists ([], lhs) -> eia_of_ir lhs
   | Exists (atoms, lhs) -> exists (List.map ir_atom_to_atom atoms) (eia_of_ir lhs)
-  | _ -> true_
+  | Ir.Unsupp s -> Ast.Unsupp (`Msg (s, Smtml.Expr.value Smtml.Value.False))
+  (* No AST counterpart: kept as a hole, which [Overapprox] relaxes by
+     polarity. Turning it into [true] made a negated one [false]. *)
+  | ( Reg _
+    | SReg _
+    | SRegRaw _
+    | SPrefixOf _
+    | SSuffixOf _
+    | SContains _
+    | SLen _
+    | SLenConst _
+    | Stoi _
+    | Itos _ ) as ir ->
+    Ast.Unsupp (`Msg (Format.asprintf "%a" Ir.pp ir, Smtml.Expr.value Smtml.Value.False))
+;;
+
+let%expect_test "a negated IR leaf without AST counterpart is not false" =
+  let ast = eia_of_ir (Ir.lnot (Ir.SLen (Ir.Var "x", Ir.Var "n"))) in
+  Format.printf "%a\n" Ast.pp_smtlib2 ast;
+  (match Overapprox.check ast with
+   | `Unsat -> print_endline "overapprox: unsat"
+   | _ -> print_endline "overapprox: not unsat");
+  [%expect
+    {|
+    (not (unsupp: (chrob.len x n), false))
+    overapprox: not unsat
+    |}]
 ;;
 
 let%expect_test _ =
@@ -708,7 +734,7 @@ let%expect_test _ =
      ast);
   [%expect
     {|
-    (<= (+ (- 1) (exp 2 (exp 2 z))) 0)
+    (<= (+ (- 1) (** 2 (** 2 z))) 0)
     IR2: (assert (<= pow2(%0)  1) )
          (assert (= (+ (* (- 1) %0) pow2(z) )  0) )
     |}]
