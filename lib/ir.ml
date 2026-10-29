@@ -88,6 +88,7 @@ type t =
   | SSuffixOf of atom * atom
   | SContains of atom * atom
   | SLen of atom * atom
+  | SLenConst of (atom * int) list
   | Stoi of atom * atom
   | Itos of atom * atom
   | Rel of rel * polynom * Z.t
@@ -106,6 +107,7 @@ let sprefixof a b = SPrefixOf (a, b)
 let ssuffixof a b = SSuffixOf (a, b)
 let scontains a b = SContains (a, b)
 let slen a b = SLen (a, b)
+let slen_const specs = SLenConst specs
 let stoi a b = Stoi (a, b)
 let itos a b = Itos (a, b)
 let rel a b c = Rel (a, b, c)
@@ -168,6 +170,13 @@ let rec pp fmt = function
   | SRegRaw (atom, re) -> Format.fprintf fmt "(str.in.re.raw %a)" pp_atom atom
   | SLen (atom, atom') ->
     Format.fprintf fmt "@[(chrob.len %a %a)@]" pp_atom atom pp_atom atom'
+  | SLenConst specs ->
+    Format.fprintf
+      fmt
+      "@[(chrob.len.const%a)@]"
+      (Format.pp_print_list (fun fmt (atom, n) ->
+         Format.fprintf fmt " %a=%d" pp_atom atom n))
+      specs
   | Stoi (atom, atom') ->
     Format.fprintf fmt "@[(= %a (chrob.to.int %a))@]" pp_atom atom pp_atom atom'
   | Itos (atom, atom') ->
@@ -261,7 +270,7 @@ let pp_smtlib2 ppf ir =
         rhs;
       (* Format.eprintf "\nexists = @[%a@]\n\n%!" pp_old e; *)
       fprintf ppf ")@]" *)
-    | ( SLen _ | Stoi _ | SReg _ | SRegRaw _
+    | ( SLen _ | SLenConst _ | Stoi _ | SReg _ | SRegRaw _
       | SPrefixOf (_, _)
       | SContains (_, _)
       | SSuffixOf (_, _)
@@ -368,6 +377,7 @@ let rec equal ir ir' =
     List.equal ( = ) atoms atoms' && equal ir ir'
   | SReg (atom, regex), SReg (atom', regex') -> atom = atom' && regex = regex'
   | SRegRaw (atom, regex), SRegRaw (atom', regex') -> atom = atom' && regex = regex'
+  | SLenConst specs, SLenConst specs' -> specs = specs'
   | SPrefixOf (atom, atom'), SPrefixOf (atom'', atom''')
   | SContains (atom, atom'), SContains (atom'', atom''')
   | SSuffixOf (atom, atom'), SSuffixOf (atom'', atom''')
@@ -385,6 +395,7 @@ let rec map2 f fleaf ir =
   | SReg (_, _) -> fleaf ir
   | SRegRaw (_, _) -> fleaf ir
   | SLen (_, _) -> fleaf ir
+  | SLenConst _ -> fleaf ir
   | Stoi (_, _) -> fleaf ir
   | Itos (_, _) -> fleaf ir
   | SPrefixOf (_, _) | SSuffixOf (_, _) | SContains (_, _) -> fleaf ir
@@ -405,6 +416,7 @@ let rec fold f acc ir =
   | SReg (_, _) -> f acc ir
   | SRegRaw (_, _) -> f acc ir
   | SLen (_, _) -> f acc ir
+  | SLenConst _ -> f acc ir
   | Stoi (_, _) -> f acc ir
   | Itos (_, _) -> f acc ir
   | SPrefixOf (_, _) | SContains (_, _) | SSuffixOf (_, _) -> f acc ir
@@ -482,6 +494,7 @@ let collect_vars ir =
        | Reg (_, atoms) -> Set.union acc (atoms |> List.map as_var |> Set.of_list)
        | SReg (atom, _) -> Set.add acc atom
        | SRegRaw (atom, _) -> Set.add acc atom
+       | SLenConst specs -> List.fold_left (fun acc (a, _) -> Set.add acc a) acc specs
        | SLen (atom, atom') -> Set.add (Set.add acc atom) atom'
        | Stoi (atom, atom') -> Set.add (Set.add acc atom) atom'
        | Itos (atom, atom') -> Set.add (Set.add acc atom) atom'
@@ -518,6 +531,7 @@ let collect_atoms ir =
        | Reg (_, atoms) -> Set.union acc (atoms |> Set.of_list)
        | SReg (atom, _) -> Set.add acc atom
        | SRegRaw (atom, _) -> Set.add acc atom
+       | SLenConst specs -> List.fold_left (fun acc (a, _) -> Set.add acc a) acc specs
        | SLen (atom, atom')
        | Stoi (atom, atom')
        | SPrefixOf (atom, atom')
@@ -543,6 +557,7 @@ let collect_free_atoms ir =
        | Reg (_, atoms) -> Set.union acc (atoms |> Set.of_list)
        | SReg (atom, _) -> Set.add acc atom
        | SRegRaw (atom, _) -> Set.add acc atom
+       | SLenConst specs -> List.fold_left (fun acc (a, _) -> Set.add acc a) acc specs
        | SLen (atom, atom')
        | Stoi (atom, atom')
        | SPrefixOf (atom, atom')
@@ -568,6 +583,7 @@ let collect_free (ir : t) =
          term |> Map.keys |> List.map as_var |> Set.of_list |> Set.union acc
        | SReg (atom, _) -> Set.add acc atom
        | SRegRaw (atom, _) -> Set.add acc atom
+       | SLenConst specs -> List.fold_left (fun acc (a, _) -> Set.add acc a) acc specs
        | SLen (atom, atom')
        | Stoi (atom, atom')
        | Itos (atom, atom')
@@ -739,18 +755,15 @@ let exists_to_div =
     | ir -> [ ir ]
   in
   fun ir ->
-    if Config.config.mod_eq = false
-    then ir
-    else
-      map
-        (function
-          | Exists (atoms, body) ->
-            let atoms, conjs = fold_atoms atoms (conjuncts_of body) in
-            (match List.rev atoms with
-             | [] -> land_ conjs
-             | atoms -> exists atoms (land_ conjs))
-          | ir -> ir)
-        ir
+    map
+      (function
+        | Exists (atoms, body) ->
+          let atoms, conjs = fold_atoms atoms (conjuncts_of body) in
+          (match List.rev atoms with
+           | [] -> land_ conjs
+           | atoms -> exists atoms (land_ conjs))
+        | ir -> ir)
+      ir
 ;;
 
 (* let simpl1 ir =
@@ -825,9 +838,26 @@ let simpl ir =
 ;;
 
 let simpl_ineq ir =
-  (* Bounds are collected across the whole tree and re-emitted conjoined, which is
-     only sound because every [Ir] pass is given a conjunction. Merging an upper
-     bound with [min] across the arms of a [Lor] would strengthen the formula. *)
+  (* Bounds are collected and re-emitted conjoined, so both the collection and
+     the erasure below must stay on the top-level conjunctive spine: merging an
+     upper bound with [min] across the arms of a [Lor] (or from under a [Lnot])
+     would strengthen the formula -- e.g. [x <= 0 /\ (x = 1 \/ x = 0)] used to
+     collapse to false by combining [x = 1] from one arm with the rest. The
+     arms themselves are simplified recursively by the wrapper at the bottom. *)
+  let fold_conj f init ir =
+    let rec go acc = function
+      | Land irs -> List.fold_left go acc irs
+      | ir -> f acc ir
+    in
+    go init ir
+  in
+  let map_conj f ir =
+    let rec go = function
+      | Land irs -> land_ (List.map go irs)
+      | ir -> f ir
+    in
+    go ir
+  in
   let simpl_ineq ir =
     let merge lowb uppb =
       let merge_bounds f = function
@@ -840,7 +870,7 @@ let simpl_ineq ir =
       merge_bounds max (lowb1, lowb2), merge_bounds min (uppb1, uppb2)
     in
     let bounds =
-      fold
+      fold_conj
         (fun list -> function
            | Rel (Eq, term, c) when Map.length term = 1 ->
              let var, coeff = Map.min_elt_exn term in
@@ -862,7 +892,7 @@ let simpl_ineq ir =
        when [c] does not divide [rhs] -- so those are simply not recorded, and get
        erased below along with the rest. *)
     let forbidden =
-      fold
+      fold_conj
         (fun list -> function
            | Rel (Neq, term, c) when Map.length term = 1 ->
              let var, coeff = Map.min_elt_exn term in
@@ -906,7 +936,7 @@ let simpl_ineq ir =
           values)
     in
     let ir_without_eq_n_leq =
-      map
+      map_conj
         (function
           | Rel (Eq, term, c) when Map.length term = 1 -> true_
           | Rel (Leq, term, c) when Map.length term = 1 -> true_
@@ -936,7 +966,7 @@ let simpl_ineq ir =
     in
     let complex_bounds_map =
       let complex_bounds =
-        fold
+        fold_conj
           (fun list -> function
              | Rel (Leq, term, value) -> (term, value) :: list
              | _ -> list)
@@ -950,7 +980,7 @@ let simpl_ineq ir =
         | [] -> assert false)
     in
     let ir_without_leq =
-      map
+      map_conj
         (function
           | Rel (Leq, term, c) -> true_
           | ir -> ir)
@@ -971,13 +1001,22 @@ let simpl_ineq ir =
     let ir = land_ (List.concat [ irs'; neq_irs; ir_without_leq :: irs ]) |> simpl in
     ir
   in
-  map
-    (function
-      | Exists (v, ir) -> exists v (simpl_ineq ir)
-      | Lnot ir' -> lnot (simpl_ineq ir')
-      | ir -> ir)
-    ir
-  |> simpl_ineq
+  (* Single top-down visit: walk the conjunctive spine and give each
+     disjunct/binder body its own recursive treatment, then run the
+     bound-merging pass on the spine. Recursing through [map] instead (which
+     visits every node) re-ran the whole pass once per [Lor] node per level
+     -- exponential on the disjunction-heavy IRs the string suites produce. *)
+  let rec top ir =
+    let rec descend = function
+      | Land irs -> land_ (List.map descend irs)
+      | Lor irs -> lor_ (List.map top irs)
+      | Lnot ir' -> lnot (top ir')
+      | Exists (v, ir') -> exists v (top ir')
+      | ir -> ir
+    in
+    simpl_ineq (descend ir)
+  in
+  top ir
 ;;
 
 let%expect_test _ =
@@ -1092,6 +1131,7 @@ let pin_unconstrained_vars ir =
     | Rel (_, poly, _) -> Map.keys poly
     | Reg (_, atoms) -> atoms
     | SReg (a, _) | SRegRaw (a, _) -> [ a ]
+    | SLenConst specs -> List.map fst specs
     | SPrefixOf (a, b)
     | SSuffixOf (a, b)
     | SContains (a, b)
@@ -1307,6 +1347,297 @@ let%expect_test "pin_unconstrained_vars" =
   show (eq (Map.singleton (var "x") (Z.of_int 3)) (Z.of_int 7));
   [%expect "(assert (= (* 3 x)  7) )  pinned: []"];
   ()
+;;
+
+module NondeterministicMonad = struct
+  let return = Seq.return
+  let bind m f = Seq.flat_map f m
+  let ( let* ) = bind
+end
+
+let get_mod_phi_of_system =
+  List.fold_left
+    (fun acc -> function
+       | Rel (Div d, _, z) when Z.(z = zero) -> Z.lcm acc d
+       | _ -> acc)
+    Z.one
+;;
+
+let first_n_numbers z =
+  let last = Z.(z - one) in
+  let rec aux i acc = if i > last then List.rev acc else aux Z.(i + one) (i :: acc) in
+  aux Z.zero []
+;;
+
+let coeff_of_var varname (poly : polynom) =
+  match Map.find poly varname with
+  | Some coeff -> coeff
+  | None -> Z.zero
+;;
+
+let find_var_and_coeff varname = function
+  | Rel (Eq, poly, c) ->
+    begin match Map.find poly varname with
+    | None -> None
+    | Some z when z = Z.zero -> None
+    | Some coeff -> Some (coeff, Map.remove poly varname, c)
+    end
+  | _ -> None
+;;
+
+let var_exists varname conj =
+  List.exists
+    (function
+      | Rel (rel, poly, c) -> coeff_of_var varname poly <> Z.zero
+      | _ -> false)
+    conj
+;;
+
+let slack_vars_in_poly =
+  let has_slack = String.starts_with ~prefix:"_slack_" in
+  let check_atom ~key ~data acc =
+    match key with
+    | Var s when has_slack s -> s :: acc
+    | Var _ | Pow2 _ -> acc
+  in
+  Map.fold ~init:[] ~f:check_atom
+;;
+
+let apply_operation_to_constraint op = function
+  | Rel (Div d, poly, c) -> Rel (Div (op d), Map.map ~f:op poly, c)
+  | Rel (rel, poly, c) -> Rel (rel, Map.map ~f:op poly, op c)
+  | t -> t
+;;
+
+let multiply_constraint_by_int coeff = apply_operation_to_constraint (Z.mul coeff)
+
+let divide_constraint_by_int coeff =
+  apply_operation_to_constraint (fun x -> Z.div x coeff)
+;;
+
+let substitute_vigorous_constraint varname coeff (tau_poly, tau_const) = function
+  | Rel (rel, poly, c) as constr ->
+    begin match Map.find poly varname with
+    | None -> constr
+    | Some b ->
+      assert (Z.equal Z.(b mod coeff) Z.zero);
+      let factor = Z.div b coeff in
+      let poly' =
+        Map.fold tau_poly ~init:(Map.remove poly varname) ~f:(fun ~key ~data acc ->
+          let d = Z.(data * -factor) in
+          match Map.find acc key with
+          | None -> if Z.equal d Z.zero then acc else Map.set acc ~key ~data:d
+          | Some e ->
+            let s = Z.(e + d) in
+            if Z.equal s Z.zero then Map.remove acc key else Map.set acc ~key ~data:s)
+      in
+      Rel (rel, poly', Z.(c - (factor * tau_const)))
+    end
+  | t -> t
+;;
+
+let eliminate_one_var conj varname subst p l =
+  let open NondeterministicMonad in
+  let eqs = List.filter_map (find_var_and_coeff varname) conj in
+  if eqs = []
+  then return (conj, subst, p, l)
+  else
+    let* coeff, tau, const = List.to_seq eqs in
+    let p = l in
+    let l = coeff in
+    let slacks = slack_vars_in_poly tau in
+    let mod_phi = get_mod_phi_of_system conj in
+    let possible_vals = first_n_numbers Z.(Z.abs coeff * mod_phi) |> List.to_seq in
+    let* subst =
+      if slacks = []
+      then return subst
+      else begin
+        let rec loop acc = function
+          | [] -> return acc
+          | key :: xs ->
+            let* data = possible_vals in
+            let acc = Map.set acc ~key ~data in
+            loop acc xs
+        in
+        loop subst slacks
+      end
+    in
+    let conj =
+      conj
+      |> List.map (multiply_constraint_by_int coeff)
+      |> List.map (substitute_vigorous_constraint varname coeff (tau, const))
+      |> List.map (divide_constraint_by_int p)
+      |> fun x -> Rel (Div (Z.abs coeff), tau, Z.zero) :: x
+    in
+    return (conj, subst, p, l)
+;;
+
+let subst_ir subst (ir : t) : t =
+  let subst_poly poly (c : Z.t) : polynom * Z.t =
+    Map.fold subst ~init:(poly, c) ~f:(fun ~key ~data (acc_poly, acc_c) ->
+      match Map.find acc_poly (Var key) with
+      | None -> acc_poly, acc_c
+      | Some coeff -> Map.remove acc_poly (Var key), Z.(acc_c - (coeff * data)))
+  in
+  match ir with
+  | Rel (rel, poly, c) ->
+    let poly', c' = subst_poly poly c in
+    Rel (rel, poly', c')
+  | ir -> ir
+;;
+
+let eliminate_existence_quantifier_branches (ir : t) =
+  let open NondeterministicMonad in
+  let introduce_slacks conjs =
+    let slack_vars = ref [] in
+    let gensym = Utils.gensym in
+    let new_conjs =
+      List.map
+        (function
+          | Rel (Leq, poly, c) ->
+            let y = gensym ~prefix:"_slack_" () in
+            let poly' = Map.set poly ~key:(Var y) ~data:Z.one in
+            slack_vars := y :: !slack_vars;
+            Rel (Eq, poly', c)
+          | other -> other)
+        conjs
+    in
+    !slack_vars, new_conjs
+  in
+  let helper xs elim_vars =
+    let slack, conj_list = introduce_slacks xs in
+    let rec eliminate_all subst conj p l = function
+      | [] -> return (conj, subst)
+      | h :: tl ->
+        let* conj, subst, p, l = eliminate_one_var conj h subst p l in
+        eliminate_all subst conj p l tl
+    in
+    let* branch, subst = eliminate_all Map.empty conj_list Z.one Z.one elim_vars in
+    let branch =
+      List.map
+        (function
+          | Rel (Eq, poly, c) as t -> begin
+            slack_vars_in_poly poly
+            |> List.find_opt (fun x -> Map.mem subst x)
+            |> function
+            | Some varname ->
+              let poly' = Map.remove poly (Var varname) in
+              begin match coeff_of_var (Var varname) poly with
+              | coeff when coeff > Z.zero -> Rel (Leq, poly', c)
+              | c -> Rel (Leq, Map.map poly' ~f:(Z.mul Z.minus_one), c)
+              end
+            | None -> t
+            end
+          | t -> t)
+        branch
+    in
+    let branch = List.map (subst_ir subst) branch in
+    let mod_phi = get_mod_phi_of_system branch in
+    let possible_vals = first_n_numbers mod_phi |> List.to_seq in
+    let rec loop env phi = function
+      | [] -> return env
+      | Var key :: tl when var_exists (Var key) phi ->
+        let* data = possible_vals in
+        let env = Map.set env ~key ~data in
+        loop env phi tl
+      | h :: tl -> loop env phi tl
+    in
+    let helper_filter = function
+      | Rel (Div o, _, z) when Z.(o = one && z = zero) -> false
+      | True -> false
+      | t -> true
+    in
+    let* env = loop Map.empty branch elim_vars in
+    branch |> List.map (subst_ir env) |> List.filter helper_filter |> return
+  in
+  (* Format.printf "%a\n" pp ir; *)
+    match ir with
+    | Exists (elim_vars, xs) ->
+      (* Format.printf "%a\n" pp xs; *)
+      begin match xs with
+      | Land conj_list -> helper conj_list elim_vars
+      | Rel (_, _, _) as rel -> helper [ rel ] elim_vars
+      | _ -> failwith "Expected a conjuction"
+      end
+    | _ -> failwith "Expected the existence quantifier"
+;;
+
+let eliminate_existence_quantifier : t -> t =
+  fun ir ->
+  let branches = eliminate_existence_quantifier_branches ir in
+  List.of_seq branches |> List.map (fun x -> land_ x) |> lor_
+;;
+
+let bound_ok (atoms : atom list) (ast : t) (bound : Z.t) : bool =
+  let pow_le base exp bound =
+    let rec aux acc b e =
+      if e = 0
+      then acc <= bound
+      else if acc > bound || b > bound
+      then false
+      else if e land 1 = 1
+      then (
+        let acc' = Z.mul acc b in
+        if acc' > bound then false else aux acc' b (e - 1))
+      else (
+        let b' = Z.mul b b in
+        if b' > bound then false else aux acc b' (e lsr 1))
+    in
+    aux Z.one base exp
+  in
+  let base =
+    Z.of_int
+      (match ast with
+       | Land xs -> List.length xs
+       | True -> 0
+       | _ -> 1)
+  in
+  let exp = List.length atoms in
+  if exp = 0
+  then Z.one <= bound
+  else if Z.sign base <= 0
+  then Z.zero <= bound
+  else if Z.(base <= one)
+  then Z.one <= bound
+  else pow_le base exp bound
+;;
+
+let split_non_linear_parts ir : atom list * atom list =
+  let pow_vars, var_vars =
+    fold
+      (fun (pow_vars, var_vars) -> function
+         | Rel (_, poly, _) ->
+           Map.fold poly ~init:(pow_vars, var_vars) ~f:(fun ~key ~data (p, v) ->
+             match key with
+             | Pow2 x -> Set.add p x, v
+             | Var x -> p, Set.add v x)
+         | _ -> pow_vars, var_vars)
+      (Set.empty, Set.empty)
+      ir
+  in
+  let nonlin = Set.to_list pow_vars |> List.map var in
+  let lin = Set.to_list (Set.diff var_vars pow_vars) |> List.map var in
+  nonlin, lin
+;;
+
+let simpl_quantifiers ir =
+  let bound = Config.config.bound_quantifier_elim in
+  let rec aux = function
+    | Exists (atoms, x) ->
+      let nonlin, lin = split_non_linear_parts x in
+      let elim_atoms = List.filter (fun a -> List.mem a lin) atoms in
+      let keep_atoms = List.filter (fun a -> List.mem a nonlin) atoms in
+      if elim_atoms = [] || not (bound_ok elim_atoms x bound)
+      then exists atoms (aux x)
+      else (
+        let dnf = eliminate_existence_quantifier (Exists (elim_atoms, x)) in
+        if keep_atoms = [] then dnf else exists keep_atoms dnf)
+    | Lnot x -> lnot (aux x)
+    | Land x -> land_ (List.map aux x)
+    | Lor x -> lor_ (List.map aux x)
+    | t -> t
+  in
+  aux ir
 ;;
 
 (** Habermehl's 2024 monotonicity simplification  *)
