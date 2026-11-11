@@ -33,28 +33,178 @@ module Symantics : Smtml_symantics = struct
   ;;
 end
 
-let cache : (string, string, _) Base.Map.t ref = ref (Base.Map.empty (module Base.String))
-let extend vk vv = cache := Base.Map.add_exn !cache ~key:vk ~data:vv
+(* A power b^x with a variable exponent becomes the variable exp_b_x; the
+   cache maps that name to (x, b). It used to be keyed by x alone, so 3^x
+   got the variable of 2^x, which no longer overapproximates the formula. *)
+let cache : (string, string * Z.t, _) Base.Map.t ref =
+  ref (Base.Map.empty (module Base.String))
+;;
 
-(* MS: Config.base () must be replaced with a base taken from the phormula *)
+(* (b - 1) x < b^x for every integer x when b >= 2, b^x being 0 for x < 0. *)
 let formulas_of_cache () =
   Base.Map.to_sequence !cache
-  |> Base.Sequence.map ~f:(fun (x, fv) ->
-    Symantics.(mul [ constz Z.(of_int !Config.base - one); var x ] < var fv))
+  |> Base.Sequence.filter_map ~f:(fun (fv, (x, base)) ->
+    if Z.(geq base (of_int 2))
+    then Some Symantics.(mul [ constz Z.(base - one); var x ] < var fv)
+    else None)
   |> Base.Sequence.to_list
 ;;
 
-let gensym base =
-  let n = ref 0 in
-  let prefix = Format.asprintf "exp_%a_" Z.pp_print base in
-  fun name ->
-    match Base.Map.find_exn !cache name with
-    | exception Base.Not_found_s _ ->
-      incr n;
-      let ans = Printf.sprintf "%s%s" prefix name in
-      extend name ans;
-      ans
-    | x -> x
+let gensym base name =
+  let fv = Format.asprintf "exp_%a_%s" Z.pp_print base name in
+  cache := Base.Map.set !cache ~key:fv ~data:(name, base);
+  fv
+;;
+
+(* [root b] is [(r, p)] with [b = r^p] and [r] minimal, for [b >= 2]. *)
+let root b =
+  let rec go p =
+    if p < 2
+    then b, 1
+    else (
+      let r = Z.root b p in
+      if Z.equal (Z.pow r p) b then r, p else go (p - 1))
+  in
+  go (Z.numbits b - 1)
+;;
+
+(* [linear t] is [Some (coefficients, constant)] when [t] is linear over
+   integer variables. *)
+let rec linear : Z.t Ast.Eia.term -> ((string, Z.t) Base.Map.Poly.t * Z.t) option =
+  let module M = Base.Map.Poly in
+  let add (m1, c1) (m2, c2) =
+    M.merge_skewed m1 m2 ~combine:(fun ~key:_ a b -> Z.add a b), Z.add c1 c2
+  in
+  let scale k (m, c) = M.map m ~f:(Z.mul k), Z.mul k c in
+  function
+  | Ast.Eia.Const c -> Some (M.empty, c)
+  | Ast.Eia.Atom (Ast.Var (x, Ast.I)) -> Some (M.singleton x Z.one, Z.zero)
+  | Ast.Eia.Add ts ->
+    List.fold_left
+      (fun acc t ->
+         match acc, linear t with
+         | Some a, Some b -> Some (add a b)
+         | _ -> None)
+      (Some (M.empty, Z.zero))
+      ts
+  | Ast.Eia.Mul ts ->
+    List.fold_left
+      (fun acc t ->
+         match acc, linear t with
+         | Some (m, c), Some b when M.is_empty m -> Some (scale c b)
+         | Some a, Some (m, c) when M.is_empty m -> Some (scale c a)
+         | _ -> None)
+      (Some (M.empty, Z.one))
+      ts
+  | _ -> None
+;;
+
+(* Constraints between the powers in the cache, added to the NIA formula
+   that overapproximates the formula [ast]. For bases 2 <= b < c:
+
+   - b^x and c^x with the same exponent variable: x <= 0 or c b^x <= b c^x,
+     that is, b^(x-1) <= c^(x-1).
+
+   - b = r^p and c = r^q with a common root r, and an equation
+     al x + be y + d = 0 among the conjuncts of [ast] that gives
+     q y = k p x + m with integers k >= 1, 0 <= m <= 64: for x >= 0 also
+     y >= 0 and c^y = r^m (b^x)^k. Only the linear consequences are added,
+     x < 0 or c^y = r^m b^x when k = 1, and x < 0 or r^m b^x <= c^y when
+     k >= 2: with the product (b^x)^k, Z3 took seconds on relaxations that
+     are satisfiable. *)
+let constraints_between_powers ast =
+  let module M = Base.Map.Poly in
+  let powers =
+    Base.Map.to_alist !cache
+    |> List.filter_map (fun (fv, (x, b)) ->
+      if Z.(geq b (of_int 2)) then Some (fv, x, b) else None)
+  in
+  let same_exponent =
+    List.concat_map
+      (fun (fb, x, b) ->
+         List.filter_map
+           (fun (fc, x', c) ->
+              if String.equal x x' && Z.lt b c
+              then
+                Some
+                  Symantics.(
+                    lor_
+                      [ var x <= constz Z.zero
+                      ; mul [ constz c; var fb ] <= mul [ constz b; var fc ]
+                      ])
+              else None)
+           powers)
+      powers
+  in
+  let equations =
+    (match ast with
+     | Ast.Land xs -> xs
+     | ph -> [ ph ])
+    |> List.filter_map (function
+      | Ast.Eia (Ast.Eia.Eq (l, r, Ast.I)) ->
+        (match linear l, linear r with
+         | Some (ml, cl), Some (mr, cr) ->
+           let m =
+             M.merge_skewed ml (M.map mr ~f:Z.neg) ~combine:(fun ~key:_ a b -> Z.add a b)
+             |> M.filter ~f:(fun a -> not (Z.equal a Z.zero))
+           in
+           (match M.to_alist m with
+            | [ (x, al); (y, be) ] -> Some (x, al, y, be, Z.sub cl cr)
+            | _ -> None)
+         | _ -> None)
+      | _ -> None)
+  in
+  let common_root =
+    List.concat_map
+      (fun (x, al, y, be, d) ->
+         List.concat_map
+           (fun (fb, u, b) ->
+              List.filter_map
+                (fun (fc, v, c) ->
+                   (* u al_u + v al_v + d = 0, with u the exponent of b *)
+                   let coefficients =
+                     if String.equal u x && String.equal v y
+                     then Some (al, be)
+                     else if String.equal u y && String.equal v x
+                     then Some (be, al)
+                     else None
+                   in
+                   match coefficients with
+                   | None -> None
+                   | Some (al_u, al_v) ->
+                     let r, p = root b
+                     and r', q = root c in
+                     let qz = Z.of_int q in
+                     let k_num = Z.neg (Z.mul qz al_u)
+                     and k_den = Z.mul al_v (Z.of_int p) in
+                     let m_num = Z.neg (Z.mul qz d) in
+                     if
+                       Z.equal r r'
+                       && Z.(equal (rem k_num k_den) zero)
+                       && Z.(equal (rem m_num al_v) zero)
+                     then (
+                       let k = Z.div k_num k_den
+                       and m = Z.div m_num al_v in
+                       if Z.(geq k one && geq m zero && leq m (of_int 64))
+                       then (
+                         let rm_b =
+                           Symantics.(mul [ constz (Z.pow r (Z.to_int m)); var fb ])
+                         in
+                         Some
+                           Symantics.(
+                             lor_
+                               [ var u < constz Z.zero
+                               ; (if Z.equal k Z.one
+                                  then var fc = rm_b
+                                  else rm_b <= var fc)
+                               ]))
+                       else None)
+                     else None)
+                powers)
+           powers)
+      equations
+  in
+  same_exponent @ common_root
 ;;
 
 exception Bitwise_op
@@ -79,7 +229,7 @@ let apply_symnatics (module S : Smtml_symantics) =
     | Land xs -> S.land_ (List.map (helper pos) xs)
     | Lor xs -> S.lor_ (List.map (helper pos) xs)
     | Eia e -> helper_eia pos e
-    | Pred s -> assert false
+    | Pred s -> S.pred s
     | Exists (vs, ph) ->
       let vs =
         List.filter_map
@@ -130,16 +280,10 @@ let check ast =
   in
   cache := Base.Map.empty (module Base.String);
   let _repr = apply_symnatics (module Symantics) ast in
-  let whole = _repr :: formulas_of_cache () in
+  let whole = (_repr :: formulas_of_cache ()) @ constraints_between_powers ast in
   Format.pp_print_flush Format.std_formatter ();
   trace_log "@[whole: @[<v>%a@]@]\n%!" (Format.pp_print_list Smtml.Expr.pp) whole;
-  let module Z3 = Smtml.Z3_mappings.Solver in
-  (* let module Z3 = Smtml.Cvc5_mappings.Solver in *)
-  let solver =
-    Z3.make ~params:Smtml.Params.(default () $ (Timeout, 200000) $ (Random_seed, 42)) ()
-  in
-  Z3.reset solver;
-  match Z3.check solver ~assumptions:whole with
+  match Utils.z3_check_with_restarts ~budget_ms:200_000 whole with
   | `Unsat ->
     if tracing_on then Format.printf "Early Unsat in %s\n%!" __FILE__;
     `Unsat
@@ -147,7 +291,7 @@ let check ast =
     trace_log "Can't decide in %s%!" __FILE__;
     if tracing_on then Format.printf "`Unknown  in %s\n%!" __FILE__;
     `Unknown ast
-  | `Sat when tracing_on ->
+  | `Sat solver when tracing_on ->
     Format.printf "Early SAT in %s ~~> Unknown\n%!" __FILE__;
     let () =
       match Smtml.Z3_mappings.Solver.model solver with
@@ -158,7 +302,7 @@ let check ast =
       | None -> ()
     in
     `Unknown ast
-  | `Sat -> `Unknown ast
+  | `Sat _ -> `Unknown ast
 ;;
 
 let check ast =
@@ -212,7 +356,7 @@ let length_abstraction ast =
           if Bool.not (NfaStr.run nfa)
           then false_
           else (
-            let csds =
+            let csds, exhaustive_upto =
               let is_eos vec =
                 match Array.length vec with
                 | 1 -> Char.equal (Array.get vec 0) Nfa.Str10.u_eos
@@ -221,7 +365,15 @@ let length_abstraction ast =
               NfaStr.filter_map nfa (fun (label, q') ->
                 if is_eos label then Option.none else Option.some (label, q'))
               |> NfaStr.to_nat
-              |> NfaStr.chrobak
+              |> NfaStr.chrobak ~max_states:Config.regex_bound
+            in
+            (* A state limit can only hide lengths past this point, so the extra
+               disjunct keeps the union a superset of the real length set and
+               the [Unsat] below stays trustworthy. *)
+            let beyond =
+              match exhaustive_upto with
+              | None -> []
+              | Some m -> [ Ast.eia (leq (const (Z.of_int (m + 1))) (var (strlens s))) ]
             in
             csds
             |> Seq.map (fun (c, d) ->
@@ -233,7 +385,7 @@ let length_abstraction ast =
                     (eq (var (strlens s)) (add [ const c; mul [ const d; var n ] ]) Ast.I)
                 ])
             |> List.of_seq
-            |> Ast.lor_)
+            |> fun ds -> Ast.lor_ (ds @ beyond))
         | _ -> Ast.true_
       ;;
 

@@ -39,8 +39,8 @@ A disjunction whose branches are all refuted by the theory.
   > (check-sat)
   > EOF
 
-  $ Chro --info dpll-unsat.smt2
-  unsat (nia)
+  $ Chro dpll-unsat.smt2
+  unsat (presimpl int)
 
 Only the second branch survives the theory check, so the problem is sat.
 
@@ -52,5 +52,5 @@ Only the second branch survives the theory check, so the problem is sat.
   > (check-sat)
   > EOF
 
-  $ Chro --info dpll-sat.smt2
-  sat (under int)
+  $ Chro dpll-sat.smt2
+  sat (presimpl int)

@@ -88,7 +88,7 @@ module type SYM0 = sig
         -> Ast.t
         -> (string, Nfa.String.t) Base.Map.Poly.t
         -> (Ast.t -> [ `Sat of unit -> Model.t | `Unknown ])
-        -> [ `Sat of unit -> Model.t | `Unknown ])
+        -> [ `Sat of Ast.t | `Unknown ])
     -> ph
 
   val pow_minus_one : term -> term
@@ -187,6 +187,7 @@ module Id_symantics :
   let lt l r = Ast.eia (Ast.Eia.lt l r)
   let true_ = Ast.true_
   let false_ = Ast.false_
+  let pred = Ast.pred
   let prj = Fun.id
   let pow_minus_one t = pow (const (-1)) t
 
@@ -371,6 +372,7 @@ module Who_in_exponents_ = struct
   let bw _ = ( ++ )
   let true_ = empty
   let false_ = empty
+  let pred _ = empty
   let land_ = List.fold_left ( ++ ) empty
   let lor_ = List.fold_left ( ++ ) empty
   let not = Fun.id
@@ -418,7 +420,7 @@ let apply_symantics (type a) (module S : SYM_SUGAR with type ph = a) ast =
     | Lnot x -> S.not (helper x)
     | True -> S.true_
     | Eia e -> helper_eia e
-    | Pred s -> assert false
+    | Pred s -> S.pred s
     | Exists (vs, ph) ->
       (*let vs =
           List.filter_map
@@ -656,23 +658,59 @@ let make_main_symantics ?alpha ?agressive ?(with_nielsen = false) env =
       | c, xs -> Ast.Eia.mul (constz c :: List.sort compare_term xs)
 
     and pow base xs =
+      let pow_in_budget ~base:b e =
+        let budget = Z.of_int (Config.huge_pow_bits ()) in
+        let abs_b = Z.abs b in
+        if Z.leq abs_b Z.one
+        then Some (Utils.powz ~base:b e) (* 0, 1 and -1 stay one digit wide *)
+        else (
+          let nbits = Z.numbits abs_b in
+          if Z.gt (Z.mul e (Z.of_int (nbits - 1))) budget
+          then None
+          else if Z.leq (Z.mul e (Z.of_int nbits)) budget
+          then Some (Utils.powz ~base:b e)
+          else (
+            let v = Utils.powz ~base:b e in
+            if Z.leq (Z.of_int (Z.numbits v)) budget then Some v else None))
+      in
       match base, xs with
       | _, Eia.Const c when c = Z.zero -> const 1
-      | Eia.Pow (base, e1), e2 -> Eia.Pow (base, Eia.Mul [ e1; e2 ])
-      | Mul ((Const c as base0) :: tl), Eia.Const e ->
+      (* A negative constant exponent folds by the standard's rules: 0 for
+         |b| > 1 or b = 0, the parity sign for |b| = 1. Substitutions
+         re-create this shape after the frontend fold, so it must be handled
+         here too -- leaving it as a Pow lets the exponent-law rewrites in
+         [mul] merge it unsoundly (2^1 * 2^-1 is 2 * 0 = 0, not 2^0). *)
+      | Eia.Const b, Eia.Const exp when Z.(lt exp zero) ->
+        constz
+          (if Z.(equal (abs b) one) then if Z.is_even exp then Z.one else b else Z.zero)
+      (* Collapsing (b^e1)^e2 to b^(e1*e2) is only an identity when e2 is a
+         nonnegative constant: for e2 < 0 the outer power truncates the
+         inner *value* to 0, which b^(e1*e2) does not. *)
+      | Eia.Pow (base, e1), (Eia.Const k as e2) when Z.(geq k zero) ->
+        Eia.Pow (base, Eia.Mul [ e1; e2 ])
+      | Mul ((Const c as base0) :: tl), Eia.Const e when Z.(geq e zero) ->
         mul [ pow base0 xs; pow (Mul tl) xs ]
       | Eia.Const b, Eia.Const exp when Z.(exp > zero) && agressive |> Option.is_none ->
-        (try const (Z.to_int (Utils.powz ~base:b exp)) with
-         | Z.Overflow -> Ast.Eia.Pow (base, xs))
+        (match pow_in_budget ~base:b exp with
+         | Some v ->
+           (try const (Z.to_int v) with
+            | Z.Overflow -> Ast.Eia.Pow (base, xs))
+         | None -> Ast.Eia.Pow (base, xs))
       | Eia.Const b, Eia.Const exp
         when Z.(exp > zero) && agressive |> Option.value ~default:false ->
-        constz (Utils.powz ~base:b exp)
+        (match pow_in_budget ~base:b exp with
+         | Some v -> constz v
+         | None -> Ast.Eia.Pow (base, xs))
       | _ -> Ast.Eia.Pow (base, xs)
     ;;
 
     let mod_ lhs rhs =
       match lhs, rhs with
-      | Ast.Eia.Const lhs, rhs -> Id_symantics.constz (Z.( mod ) lhs rhs)
+      (* Euclidean, like SMT-LIB [mod] and the [NfaCollection] congruence
+         automata: the result lies in [0, |rhs|) whatever the sign of [lhs].
+         [Z.( mod )] is truncated division and would fold [(mod (- 3) 2)]
+         to [-1] where every other layer of the solver says [1]. *)
+      | Ast.Eia.Const lhs, rhs -> Id_symantics.constz (Z.erem lhs rhs)
       | lhs, rhs -> Id_symantics.mod_ lhs rhs
     ;;
 
@@ -759,13 +797,16 @@ let make_main_symantics ?alpha ?agressive ?(with_nielsen = false) env =
       | Ast.Eia (Ast.Eia.Leq (lhs, rhs)) -> Ast.eia (Ast.Eia.gt lhs rhs)
       (* TODO: this is a dishonest invert here. It actually uses 0-9$ as an alphabet. *)
       | Ast.Eia (Ast.Eia.InReRaw (v, S, re)) when Option.is_some alpha ->
-        Id_symantics.in_re_raw v (re |> Nfa.String.invert ?alpha)
+        Id_symantics.in_re_raw v (re |> Nfa.complement_string ~alpha:(Option.get alpha))
       | Ast.Eia (Ast.Eia.InReRaw (v, I, re)) when Option.is_some alpha ->
-        Id_symantics.in_re_rawi v (re |> Nfa.String.invert ?alpha)
+        Id_symantics.in_re_rawi v (re |> Nfa.complement_string ~alpha:(Option.get alpha))
       (* TODO: this is a dishonest invert here. It actually uses 0-9$ as an alphabet. *)
       | Ast.Eia (Ast.Eia.InRe (v, kind, re)) when Option.is_some alpha ->
         Ast.eia
-          (Ast.Eia.inreraw v kind (Nfa.String.invert ?alpha (Nfa.String.of_regex re)))
+          (Ast.Eia.inreraw
+             v
+             kind
+             (Nfa.complement_string ~alpha:(Option.get alpha) (Nfa.String.of_regex re)))
       | Ast.Eia (Ast.Eia.Eq (lhs, rhs, I)) -> Id_symantics.neqz lhs rhs
       | Ast.Eia (Ast.Eia.Eq (lhs, rhs, S)) -> Id_symantics.neq_str lhs rhs
       | Ast.Lnot x -> x
@@ -1029,12 +1070,12 @@ let make_main_symantics ?alpha ?agressive ?(with_nielsen = false) env =
       | Concat (x :: _ as llhs), y when x = y -> trim llhs [ y ]
       | x, Concat (y :: _ as lrhs) when x = y -> trim [ x ] lrhs
       | Concat llhs, Str_const _ ->
-        (match llhs with
-         | Str_const _ :: _ -> trim llhs [ rhs ]
+        (match llhs, List.rev llhs with
+         | Str_const _ :: _, _ | _, Str_const _ :: _ -> trim llhs [ rhs ]
          | _ -> if_with_nielsen (nielsen llhs [ rhs ]))
       | Str_const _, Concat lrhs ->
-        (match lrhs with
-         | Str_const _ :: _ -> trim [ lhs ] lrhs
+        (match lrhs, List.rev lrhs with
+         | Str_const _ :: _, _ | _, Str_const _ :: _ -> trim [ lhs ] lrhs
          | _ -> if_with_nielsen (nielsen [ lhs ] lrhs))
       | Concat llhs, Concat lrhs -> if_with_nielsen (nielsen llhs lrhs)
       | _ -> Id_symantics.eq_str lhs rhs
@@ -1055,7 +1096,9 @@ let make_main_symantics ?alpha ?agressive ?(with_nielsen = false) env =
       | (v, Ast.Eia.Str_const c | Ast.Eia.Str_const c, v) when Option.is_some alpha ->
         Id_symantics.in_re_raw
           v
-          (Regex.str_to_re c |> Nfa.String.of_regex |> Nfa.String.invert ?alpha)
+          (Regex.str_to_re c
+           |> Nfa.String.of_regex
+           |> Nfa.complement_string ~alpha:(Option.get alpha))
       | eiat1, eiat2 when Ast.Eia.eq_term eiat1 eiat2 -> Ast.false_
       | Concat llhs, Concat lrhs
         when match llhs, lrhs with
@@ -1318,7 +1361,7 @@ let%test_module _ =
       [%expect
         {|
         (and
-          (<= (+ (- 52) (exp 10 x) (exp 10 y)) 0)
+          (<= (+ (- 52) (** 10 x) (** 10 y)) 0)
           (<= (+ x (* (- 3) y)) 0))
 
         Exp: x y
@@ -1344,7 +1387,7 @@ let%test_module _ =
         (and
           (<= (+ (- 13) (* 5 x)) 0)
           (<= (+ (- 52) x z) 0)
-          (<= (+ 13 (* (- 5) x) (* (- 7) z) (* (- 8) (exp 2 y))) 0))
+          (<= (+ 13 (* (- 5) x) (* (- 7) z) (* (- 8) (** 2 y))) 0))
 
         Exp: y
         Str:
@@ -1453,7 +1496,7 @@ let shrink_variables ast =
     (* TODO(Kakadu): maybe a syntax extension for better matching? *)
     (* TODO: detect base from variable usage  *)
     let good_enough_constant rhs =
-      Z.(lt zero rhs) && Z.lt rhs (Z.of_int (Config.huge_const ()))
+      Z.(lt zero rhs) && Z.lt rhs (Z.of_int (Config.huge_rewrite_const ()))
     ;;
 
     let leq l r =
@@ -1546,11 +1589,11 @@ let%test_module "about shrinking" =
       [%expect
         {|
         (and
-          (<= (+ (- 52) (exp 10 x) (exp 10 y)) 0)
+          (<= (+ (- 52) (** 10 x) (** 10 y)) 0)
           (<= (+ (- 3) x) 0))
 
         (and
-          (<= (+ (- 52) (exp 10 x) (exp 10 y)) 0)
+          (<= (+ (- 52) (** 10 x) (** 10 y)) 0)
           (<= (+ (- 3) x) 0))
         |}]
     ;;
@@ -1567,12 +1610,12 @@ let%test_module "about shrinking" =
       [%expect
         {|
         (and
-          (<= (+ (- 5000) (exp 10 u) (exp 10 v) (exp 10 x) (exp 10 y)) 0)
+          (<= (+ (- 5000) (** 10 u) (** 10 v) (** 10 x) (** 10 y)) 0)
           (<= (+ x (* (- 1) y)) 0)
           (<= (+ (* (- 1) u) v) 0))
 
         (and
-          (<= (+ (- 5000) (exp 10 u) (exp 10 v) (exp 10 x) (exp 10 y)) 0)
+          (<= (+ (- 5000) (** 10 u) (** 10 v) (** 10 x) (** 10 y)) 0)
           (<= (+ x (* (- 1) y)) 0)
           (<= (+ (* (- 1) u) v) 0))
         |}]
@@ -1587,11 +1630,11 @@ let%test_module "about shrinking" =
       [%expect
         {|
         (and
-          (<= (+ (- 52) (exp 10 x) (exp 10 y)) 0)
+          (<= (+ (- 52) (** 10 x) (** 10 y)) 0)
           (<= (+ x (* (- 3) y)) 0))
 
         (and
-          (<= (+ (- 52) (exp 10 x) (exp 10 y)) 0)
+          (<= (+ (- 52) (** 10 x) (** 10 y)) 0)
           (<= (+ x (* (- 3) y)) 0))
         |}]
     ;;
@@ -2346,19 +2389,12 @@ let lower_mod ast =
       let zz = Ast.Eia.(Const z) in
       extend (leq (constz Z.zero) r);
       extend (lt r zz);
-      if Config.config.mod_eq
-      then
-        (* [r = t (mod z)] said as the congruence shape [Me] reads into an
-           [Ir.Div]: the remainder track stays range-bounded and no unbounded
-           quotient track is spent. Under [-no-mod-eq] the [Div] machinery is
-           off, so the classical [t = z*q + r] flattening remains. *)
-        extend
-          (eqz
-             (Ast.Eia.mod_ (add [ t; mul [ constz Z.minus_one; r ] ]) z)
-             (constz Z.zero))
-      else (
-        let q = var (gensym ~prefix:"%q" ()) in
-        extend (eqz t (add [ mul [ zz; q ]; r ])));
+      (* [r = t (mod z)] said as the congruence shape [Me] reads into an
+         [Ir.Div]: the remainder track stays range-bounded and no unbounded
+         quotient track is spent, which the classical [t = z*q + r] flattening
+         would cost. *)
+      extend
+        (eqz (Ast.Eia.mod_ (add [ t; mul [ constz Z.minus_one; r ] ]) z) (constz Z.zero));
       r
     ;;
   end
@@ -2368,8 +2404,7 @@ let lower_mod ast =
      automaton. Lowering it here would spend two fresh unbounded variables per
      occurrence -- which is exactly what quantifier elimination produces a lot
      of. Anything else, including a [mod] nested inside a term, still gets
-     lowered the usual way -- as does everything, congruence or not, under
-     [-no-mod-eq]. *)
+     lowered the usual way. *)
   let rec has_mod : 'a. 'a Ast.Eia.term -> bool =
     fun (type a) (t : a Ast.Eia.term) : bool ->
     match t with
@@ -2379,13 +2414,11 @@ let lower_mod ast =
     | _ -> false
   in
   let is_congruence ph =
-    Config.config.mod_eq
-    &&
-      match ph with
-      | Ast.Eia (Ast.Eia.Eq (Ast.Eia.Mod (t, m), Ast.Eia.Const c, Ast.I))
-      | Ast.Eia (Ast.Eia.Eq (Ast.Eia.Const c, Ast.Eia.Mod (t, m), Ast.I)) ->
-        Z.(geq c zero) && Z.(lt c (abs m)) && not (has_mod t)
-      | _ -> false
+    match ph with
+    | Ast.Eia (Ast.Eia.Eq (Ast.Eia.Mod (t, m), Ast.Eia.Const c, Ast.I))
+    | Ast.Eia (Ast.Eia.Eq (Ast.Eia.Const c, Ast.Eia.Mod (t, m), Ast.I)) ->
+      Z.(geq c zero) && Z.(lt c (abs m)) && not (has_mod t)
+    | _ -> false
   in
   let rec walk ph =
     if is_congruence ph
@@ -2468,6 +2501,7 @@ struct
   let bw _ = ( ++ )
   let true_ = empty
   let false_ = empty
+  let pred _ = empty
   let land_ = List.fold_left ( ++ ) empty
   let lor_ = List.fold_left ( ++ ) empty
   let not = Fun.id
@@ -2564,7 +2598,7 @@ let rec basic_simplify
      conjunction still simplifies to a contradiction (relative to the initial
      [env]). Every deletion is verified by re-running the simplifier, so no
      justification can be lost the way the old reachability-based "short env"
-     shortening used to lose cross-variable ones. Capped so a huge candidate
+     shortening used to lose cross-variable ones. Bounded so a huge candidate
      core does not trigger a quadratic pile of simplifier reruns. *)
   let minimize_core literals =
     let still_unsat = function
@@ -2589,7 +2623,7 @@ let rec basic_simplify
     "Alphabet with extra char: %a\n%!"
     Format.(pp_print_list ~pp_sep:(fun ppf () -> fprintf ppf " ") pp_print_char)
     alpha;
-  let rec loop step (env : Env.t) ast =
+  let rec loop ?prev step (env : Env.t) ast =
     let (module Symantics) = make_main_symantics ~alpha ~with_nielsen env in
     let rez = apply_symantics (module Symantics) ast in
     let ast2 = Symantics.prj rez in
@@ -2601,9 +2635,14 @@ let rec basic_simplify
     let __ _ = trace_log "env2 = %a" (Env.pp ~title:"") env2 in
     let __ () = trace_log "ast2 = @[%a@]" Ast.pp_smtlib2 ast2 in
     let next_step = next step in
+    let repeated =
+      match prev with
+      | Some prev -> Ast.equal prev ast2
+      | None -> false
+    in
     match
       ( Env.length env2 > Env.length env
-      , Ast.equal ast ast2
+      , Ast.equal ast ast2 || repeated
       , Ast.equal Ast.True ast2 || Ast.equal Ast.false_ ast2 )
     with
     | true, equal, _ ->
@@ -2613,7 +2652,7 @@ let rec basic_simplify
       loop next_step (Env.merge_exn env2 env) ast2
     | false, false, false ->
       trace_log "iter(%a)= @[%a@]" pp_step next_step Ast.pp_smtlib2 ast2;
-      loop next_step env ast2
+      loop ~prev:ast next_step env ast2
     | false, equal, _ ->
       if not equal then trace_log "iter(%a)= @[%a@]" pp_step next_step Ast.pp_smtlib2 ast2;
       trace_log "fixed-point\n";
@@ -2641,22 +2680,6 @@ let rec basic_simplify
          | (atomic :: _ as contras), trues ->
            trace_log "contradicting clause: %a" Ast.pp_smtlib2 atomic;
            trace_log "contradicting env: %a" (Env.pp ~title:"") env;
-           (* Every literal that substitutes to [True] under [env] stays in the
-              candidate core: the literals that produced a binding substitute
-              to [True] under it, so this keeps the core's justification
-              closed -- [atomic] is false under [env] and the retained
-              literals force [env]. Restricting to the variables reachable
-              from [atomic] through env equations used to drop cross-variable
-              justifications (e.g. [y = ""] derived from [|x| <= 0] and
-              [|x| = |y|]), and the resulting satisfiable "core" became a DPLL
-              blocking clause that excluded sat assignments.
-
-              [minimize_core] then shrinks the candidate by verified
-              deletions. It is seeded with every contradicting literal, not
-              just [atomic]: refuting the first one found may need a long
-              chain of justifications while another falls to a two-literal
-              core, and deletion filtering can only ever reach cores that are
-              subsets of its seed. *)
            let candidate = contras @ trues in
            let core_literals =
              if minimize && List.length candidate <= max_minimized_core_size
@@ -2739,15 +2762,10 @@ let check_nia env ast =
   (* trace_log "ast2=@[%a@]" Ast.pp_smtlib2 ast; *)
   let ph = apply_symantics (make_smtml_symantics Utils.Map.empty) ast in
   trace_log "Into Z3 goes: @[%a@]\n%!" Smtml.Expr.pp ph;
-  let solver =
-    Z3.make
-      ~logic:Smtml.Logic.QF_NIA
-      ()
-      ~params:Smtml.Params.(default () $ (Timeout, 200000) $ (Random_seed, 42))
-  in
-  Z3.reset solver;
-  match Z3.check solver ~assumptions:[ ph ] with
-  | `Sat ->
+  match
+    Utils.z3_check_with_restarts ~logic:Smtml.Logic.QF_NIA ~budget_ms:200_000 [ ph ]
+  with
+  | `Sat solver ->
     (match Z3.model solver with
      | None -> assert false
      | Some m ->
@@ -2906,23 +2924,6 @@ let rewrite_via_concat { Info.all; _ } =
     ;;
   end
   in
-  (* Shared positional decomposition. py-conbyte-style formulas probe the same
-     string at many constant offsets ([str.substr s 0 1], [str.at s 3], ...);
-     lowering each site through [split_vars] mints an independent seven-variable
-     conditional split of the same string, so five sites cost ~35 fresh
-     variables and 2^5 branch combinations. Instead, all constant-offset sites
-     on one variable share a single segmentation [v = g1 ++ ... ++ gk ++ tail]
-     cut at every offset any site needs, with one branch per length window
-     [q_j <= |v| < q_j+1] handling the SMT-LIB out-of-range semantics. The
-     branch guards are pure length constraints, which the skeleton length
-     axioms resolve upfront when |v| is bounded.
-
-     Sharing happens by pre-populating [substr_cache]/[at_cache] before the
-     rewrite: sites the collector recognized hit the cache, everything else
-     falls back to [split_vars]. A missed cache key (a term the rewriter
-     normalizes differently than the input) only loses the sharing, never
-     soundness: the fallback encoding is still emitted, and the orphaned shared
-     variables stay consistent with it. *)
   let prepopulate_shared ast =
     let module PSet = Base.Set.Poly in
     let site_of_term term =
@@ -3122,7 +3123,26 @@ let rewrite_via_concat { Info.all; _ } =
     let ast' = Rewrite.prj (ast |> apply_symantics_unsugared (module Rewrite)) in
     if Ast.is_simpl ast' then ast' else loop ast'
   in
+  let not_affix parts s t =
+    let u = Ast.Eia.atom (Ast.var (gensym ()) S) in
+    let w = Ast.Eia.atom (Ast.var (gensym ()) S) in
+    Id_symantics.land_
+      [ Id_symantics.eq_str t (Ast.Eia.concat (parts u w))
+      ; Id_symantics.leq (Ast.Eia.len u) (Ast.Eia.len s)
+      ; Id_symantics.lor_
+          [ Id_symantics.eqz (Ast.Eia.len u) (Ast.Eia.len s)
+          ; Id_symantics.eqz (Ast.Eia.len w) (Ast.Eia.Const Z.zero)
+          ]
+      ; Id_symantics.neq_str u s
+      ]
+  in
+  let negated = function
+    | Ast.Lnot (Ast.Eia (Ast.Eia.PrefixOf (s, t))) -> not_affix (fun u w -> [ u; w ]) s t
+    | Ast.Lnot (Ast.Eia (Ast.Eia.SuffixOf (s, t))) -> not_affix (fun u w -> [ w; u ]) s t
+    | ast -> ast
+  in
   fun ph ->
+    let ph = Ast.map negated ph in
     (try prepopulate_shared ph with
      | exn -> trace_log "prepopulate_shared gave up: %s" (Printexc.to_string exn));
     loop ph
@@ -3200,6 +3220,9 @@ let under_str env alpha vars ast =
       | `Sat _ | `Unknown _ -> false)
     |> Set.of_list
   in
+  let is_internal c =
+    Char.equal c Config.string_config.null || Char.equal c Config.string_config.eos
+  in
   let get_strings_range nfa length ?(exact = false) num =
     let max_len = Config.under_str_config.max_len in
     (if length < 0
@@ -3209,10 +3232,7 @@ let under_str env alpha vars ast =
        | true -> NfaS.any_n_paths nfa ~len:length num
        | _ -> 0 -- length |> List.concat_map (fun x -> NfaS.any_n_paths nfa ~len:x num)))
     |> List.map (fun c -> List.to_seq c |> String.of_seq)
-    |> List.map (fun c ->
-      if String.length c > 0
-      then String.sub c 0 (String.length c - 1)
-      else c (* Format.printf ">>>>> %s\n%!" c; *))
+    |> List.filter (fun s -> not (String.exists is_internal s))
     |> List.sort_uniq (fun x y ->
       match String.length x - String.length y with
       | 0 -> String.compare x y
@@ -3246,11 +3266,11 @@ let under_str env alpha vars ast =
            variable gets thousands of candidates where three variables get a
            handful each, instead of a flat [max_cnt] for every arity. *)
         let per_var =
-          let cap = Config.under_str_config.max_envs in
+          let bound = Config.under_str_config.max_envs in
           let m = Set.length vars in
-          if cap < 0
+          if bound < 0
           then Config.under_str_config.max_cnt
-          else Int.max 2 (Float.to_int (Float.of_int cap ** (1. /. Float.of_int m)))
+          else Int.max 2 (Float.to_int (Float.of_int bound ** (1. /. Float.of_int m)))
         in
         (* [base^l], clamped against overflow. *)
         let space base l =
@@ -3267,6 +3287,7 @@ let under_str env alpha vars ast =
             then Regex.dec |> String.to_seq |> List.of_seq
             else
               alpha
+              |> List.filter (Fun.negate is_internal)
               |> Set.of_list
               |> (fun x ->
               Seq.fold_left
@@ -3282,7 +3303,7 @@ let under_str env alpha vars ast =
              so waiting for their exact-length round would push them past the
              caller's time budget. Later rounds still add exact-length
              coverage beyond the initial sample. *)
-          (* Regex-constrained variables keep the small flat cap: their
+          (* Regex-constrained variables keep the small flat bound: their
              candidates are pumped words whose length grows with the index,
              and every extra candidate makes both the substitution and the
              automata check on the residual superlinearly more expensive --
@@ -3292,7 +3313,7 @@ let under_str env alpha vars ast =
             if is_regex then min per_var Config.under_str_config.max_cnt else per_var
           in
           (* Multi-variable sets keep the legacy sampler: ranged rounds with
-             the flat cap. The balanced exact-length enumeration below is
+             the flat bound. The balanced exact-length enumeration below is
              only proven for singletons; for products it reshuffles which
              slice of the tuple space gets sampled and loses low-total-length
              witness pairs (the stringfuzz [("0s", "0")] models) that the
@@ -3451,6 +3472,12 @@ let split_concats ast =
       | str -> Id_symantics.in_re l regex
     ;;
 
+    let in_re_raw l nfa =
+      match l with
+      | Ast.Eia.Concat xs -> split xs nfa
+      | _ -> Id_symantics.in_re_raw l nfa
+    ;;
+
     let rec str_len str =
       match str with
       | Ast.Eia.Concat xs -> Id_symantics.add (List.map str_len xs)
@@ -3542,7 +3569,389 @@ let run_string_simplify ast =
   |> fun res -> res
 ;;
 
-let run_basic_simplify ?(env = Env.empty) ast =
+(* Whether every power in the formula lies in the automata engine's
+   fragment: a constant base >= 2. Anything else (bases 0, 1, negatives,
+   non-constant bases) makes the NFA stage bail out of the whole process, so
+   the two-phase driver must not attempt the un-split formula on those. *)
+let engine_pows_only ast =
+  let module E = Ast.Eia in
+  Ast.fold
+    (fun acc -> function
+       | Ast.Eia eia ->
+         acc
+         && E.fold2
+              (fun acc -> function
+                 | E.Pow (E.Const b, _) -> acc && Z.(geq b (of_int 2))
+                 | E.Pow (_, _) -> false
+                 | _ -> acc)
+              (fun acc _ -> acc)
+              true
+              eia
+       | _ -> acc)
+    true
+    ast
+;;
+
+let std_exp_split ast =
+  let module E = Ast.Eia in
+  let term_eq t t' = Stdlib.compare t t' = 0 in
+  let term_key t = Format.asprintf "%a" E.pp_term t in
+  let contains_pow eia =
+    E.fold2
+      (fun acc -> function
+         | E.Pow _ -> true
+         | _ -> acc)
+      (fun acc _ -> acc)
+      false
+      eia
+  in
+  let pow_count =
+    Ast.fold
+      (fun acc -> function
+         | Ast.Eia eia ->
+           E.fold2
+             (fun acc -> function
+                | E.Pow _ -> acc + 1
+                | _ -> acc)
+             (fun acc _ -> acc)
+             acc
+             eia
+         | _ -> acc)
+      0
+      ast
+  in
+  if pow_count = 0
+  then ast
+  else (
+    (* The proof obligation deliberately uses only pow-free atoms: proving
+       nonnegativity *through* a pow atom would assume the partial
+       semantics being repaired here. *)
+    let pow_free_atoms =
+      let rec go acc = function
+        | Ast.Land xs -> List.fold_left go acc xs
+        | (Ast.Eia eia | Ast.Lnot (Ast.Eia eia)) as ph ->
+          if contains_pow eia then acc else ph :: acc
+        | _ -> acc
+      in
+      go [] ast
+    in
+    (* Interval bounds harvested from single-variable linear pow-free atoms.
+       [basic_simplify] is a rewriting engine with no inequality reasoning,
+       so guards like [1000 <= x] are invisible to the probe below -- this
+       syntactic pass is what actually discharges the guarded-exponent
+       benchmarks. *)
+    let var_bounds : (string, Z.t option * Z.t option) Hashtbl.t = Hashtbl.create 8 in
+    let () =
+      (* [linear t] = Some (coeffs, konst) when t is linear over integer
+         variables. *)
+      let rec linear : Z.t E.term -> (Z.t Base.Map.M(Base.String).t * Z.t) option =
+        function
+        | E.Const c -> Some (Base.Map.empty (module Base.String), c)
+        | E.Atom (Ast.Var (v, Ast.I)) ->
+          Some (Base.Map.singleton (module Base.String) v Z.one, Z.zero)
+        | E.Add ts ->
+          List.fold_left
+            (fun acc t ->
+               match acc, linear t with
+               | Some (m, c), Some (m', c') ->
+                 Some
+                   ( Base.Map.merge_skewed m m' ~combine:(fun ~key:_ a b -> Z.add a b)
+                   , Z.add c c' )
+               | _ -> None)
+            (Some (Base.Map.empty (module Base.String), Z.zero))
+            ts
+        | E.Mul ts ->
+          (* Only a product of constants and at most one linear factor stays
+             linear. *)
+          List.fold_left
+            (fun acc t ->
+               match acc with
+               | None -> None
+               | Some (m, c) ->
+                 (match linear t with
+                  | None -> None
+                  | Some (m', c') ->
+                    if Base.Map.is_empty m
+                    then Some (Base.Map.map m' ~f:(Z.mul c), Z.mul c c')
+                    else if Base.Map.is_empty m'
+                    then Some (Base.Map.map m ~f:(Z.mul c'), Z.mul c c')
+                    else None))
+            (Some (Base.Map.empty (module Base.String), Z.one))
+            ts
+        | _ -> None
+      in
+      (* Record [t <= 0] when t is linear in exactly one variable. *)
+      let note_le_zero t =
+        match linear t with
+        | Some (m, c) when Base.Map.length m = 1 ->
+          let v, k = Base.Map.min_elt_exn m in
+          if Z.(equal k zero)
+          then ()
+          else (
+            let lo, hi =
+              Option.value ~default:(None, None) (Hashtbl.find_opt var_bounds v)
+            in
+            let tighten =
+              (* k*v + c <= 0, so v <= (-c)/k rounded down for positive k
+                 and v >= (-c)/k rounded up for negative k. *)
+              if Z.(gt k zero)
+              then (
+                let b = Z.fdiv (Z.neg c) k in
+                ( lo
+                , Some
+                    (match hi with
+                     | Some h -> Z.min h b
+                     | None -> b) ))
+              else (
+                let b = Z.cdiv (Z.neg c) k in
+                ( Some
+                    (match lo with
+                     | Some l -> Z.max l b
+                     | None -> b)
+                , hi ))
+            in
+            Hashtbl.replace var_bounds v tighten)
+        | _ -> ()
+      in
+      let sub l r = E.add [ l; E.mul [ E.Const Z.minus_one; r ] ] in
+      let note = function
+        | Ast.Eia (E.Leq (l, r)) -> note_le_zero (sub l r)
+        | Ast.Lnot (Ast.Eia (E.Leq (l, r))) ->
+          (* not (l <= r)  <=>  r + 1 <= l *)
+          note_le_zero (sub (E.add [ r; E.Const Z.one ]) l)
+        | Ast.Eia (E.Eq (l, r, Ast.I)) ->
+          note_le_zero (sub l r);
+          note_le_zero (sub r l)
+        | _ -> ()
+      in
+      List.iter note pow_free_atoms
+    in
+    let interval_nonneg e =
+      (* Lower/upper interval evaluation; None encodes the infinite bound. *)
+      let scale k (lo, hi) =
+        if Z.(equal k zero)
+        then Some Z.zero, Some Z.zero
+        else (
+          let m = Option.map (Z.mul k) in
+          if Z.(gt k zero) then m lo, m hi else m hi, m lo)
+      in
+      let rec go : Z.t E.term -> Z.t option * Z.t option = function
+        | E.Const c -> Some c, Some c
+        | E.Atom (Ast.Var (v, Ast.I)) ->
+          Option.value ~default:(None, None) (Hashtbl.find_opt var_bounds v)
+        | E.Add ts ->
+          List.fold_left
+            (fun (alo, ahi) t ->
+               let lo, hi = go t in
+               ( (match alo, lo with
+                  | Some a, Some b -> Some (Z.add a b)
+                  | _ -> None)
+               , match ahi, hi with
+                 | Some a, Some b -> Some (Z.add a b)
+                 | _ -> None ))
+            (Some Z.zero, Some Z.zero)
+            ts
+        | E.Mul ts ->
+          (* Constant-by-interval products only; a variable-by-variable
+             product falls back to unknown. *)
+          let k, rest =
+            List.fold_left
+              (fun (k, rest) -> function
+                 | E.Const c -> Z.mul k c, rest
+                 | t -> k, t :: rest)
+              (Z.one, [])
+              ts
+          in
+          (match rest with
+           | [] -> Some k, Some k
+           | [ t ] -> scale k (go t)
+           | _ -> None, None)
+        | E.Mod (_, m) ->
+          (* SMT-LIB mod is Euclidean: the result lies in [0, |m|-1]. *)
+          Some Z.zero, Some Z.(abs m - one)
+        | E.Pow (E.Const b, _) when Z.(geq b zero) ->
+          (* Total semantics: a nonnegative base never produces a negative
+             power (negative exponents collapse to 0 or 1). *)
+          Some Z.zero, None
+        | _ -> None, None
+      in
+      match go e with
+      | Some lo, _ -> Z.(geq lo zero)
+      | None, _ -> false
+    in
+    let proven_nonneg =
+      let memo = Hashtbl.create 8 in
+      fun e ->
+        let key = term_key e in
+        match Hashtbl.find_opt memo key with
+        | Some b -> b
+        | None ->
+          let b =
+            interval_nonneg e
+            ||
+            let probe =
+              Ast.land_ (Ast.eia (E.leq e (E.Const Z.minus_one)) :: pow_free_atoms)
+            in
+            match basic_simplify [] ~minimize:false Env.empty probe with
+            | `Unsat _ -> true
+            | `Sat _ | `Unknown _ -> false
+          in
+          Hashtbl.add memo key b;
+          b
+    in
+    let mentions_ph p ph =
+      Ast.fold
+        (fun acc -> function
+           | Ast.Eia eia ->
+             acc || E.fold2 (fun acc t -> acc || term_eq t p) (fun acc _ -> acc) false eia
+           | _ -> acc)
+        false
+        ph
+    in
+    let under_binder p ph =
+      Ast.fold
+        (fun acc -> function
+           | Ast.Exists (_, body) -> acc || mentions_ph p body
+           | _ -> acc)
+        false
+        ph
+    in
+    let global_subst p repl =
+      Ast.map (function
+        | Ast.Eia eia ->
+          Ast.eia (E.map2 Fun.id (fun t -> if term_eq t p then repl else t) Fun.id eia)
+        | ph -> ph)
+    in
+    (* One splittable occurrence at a time, re-scanning after each rewrite:
+       an inner power replaced by its result variable turns the enclosing
+       power into a fresh occurrence over a new exponent term, so nesting
+       converges without any ordering discipline. [skipped] holds the
+       occurrences deliberately left on the engine's exact fragment (proven
+       nonnegative, under a binder, or the fresh aliases this pass itself
+       creates). A power skipped under a binder keeps the engine's legacy
+       partial semantics -- verdicts on quantified formulas are only as
+       standard-exact as that fragment. *)
+    let find_occ skipped ph =
+      Ast.fold
+        (fun acc -> function
+           | Ast.Eia eia ->
+             E.fold2
+               (fun acc t ->
+                  match acc, t with
+                  | Some _, _ -> acc
+                  | None, E.Pow (E.Const _, E.Const _) -> acc
+                  | None, (E.Pow (E.Const _, _) as p) | None, (E.Pow (_, E.Const _) as p)
+                    -> if Base.Set.Poly.mem skipped (term_key p) then acc else Some p
+                  | None, _ -> acc)
+               (fun acc _ -> acc)
+               acc
+               eia
+           | _ -> acc)
+        None
+        ph
+    in
+    let rec loop skipped splits_left ast =
+      if splits_left <= 0
+      then ast
+      else (
+        match find_occ skipped ast with
+        | None -> ast
+        | Some p ->
+          let skip () = loop (Base.Set.Poly.add skipped (term_key p)) splits_left ast in
+          if under_binder p ast
+          then skip ()
+          else (
+            let case_split cases =
+              let r = E.Atom (Ast.Var (gensym ~prefix:"%stdexp" (), Ast.I)) in
+              let def =
+                Ast.lor_
+                  (List.map
+                     (fun (guards, value) ->
+                        Ast.land_ (guards @ [ Ast.eia (E.eq r value Ast.I) ]))
+                     cases)
+              in
+              Ast.land_ [ global_subst p r ast; def ]
+            in
+            let subst repl = global_subst p repl ast in
+            let alias () =
+              let u = E.Atom (Ast.Var (gensym ~prefix:"%stdexp" (), Ast.I)) in
+              u
+            in
+            match p with
+            | E.Pow (E.Const b, e) ->
+              let x_is_zero = Ast.eia (E.eq e (E.Const Z.zero) Ast.I) in
+              let even = Ast.eia (E.eq (E.Mod (e, Z.of_int 2)) (E.Const Z.zero) Ast.I) in
+              let odd = Ast.eia (E.eq (E.Mod (e, Z.of_int 2)) (E.Const Z.one) Ast.I) in
+              let nonneg = Ast.eia (E.leq (E.Const Z.zero) e) in
+              let negative = Ast.eia (E.leq e (E.Const Z.minus_one)) in
+              if Z.(equal b one)
+              then loop skipped (splits_left - 1) (subst (E.Const Z.one))
+              else if Z.(equal b zero)
+              then
+                loop
+                  skipped
+                  (splits_left - 1)
+                  (case_split
+                     [ [ x_is_zero ], E.Const Z.one
+                     ; [ Ast.lnot x_is_zero ], E.Const Z.zero
+                     ])
+              else if Z.(equal b minus_one)
+              then
+                loop
+                  skipped
+                  (splits_left - 1)
+                  (case_split [ [ even ], E.Const Z.one; [ odd ], E.Const Z.minus_one ])
+              else if Z.(geq b (of_int 2)) && proven_nonneg e
+              then skip ()
+              else if Z.(geq b (of_int 2))
+              then (
+                let u = alias () in
+                let pu = E.Pow (E.Const b, u) in
+                loop
+                  (Base.Set.Poly.add skipped (term_key pu))
+                  (splits_left - 1)
+                  (case_split
+                     [ [ nonneg; Ast.eia (E.eq u e Ast.I) ], pu
+                     ; [ negative ], E.Const Z.zero
+                     ]))
+              else (
+                (* b <= -2: |b|^e with the sign decided by the parity. *)
+                let u = alias () in
+                let pu = E.Pow (E.Const (Z.abs b), u) in
+                loop
+                  (Base.Set.Poly.add skipped (term_key pu))
+                  (splits_left - 1)
+                  (case_split
+                     [ [ nonneg; even; Ast.eia (E.eq u e Ast.I) ], pu
+                     ; ( [ nonneg; odd; Ast.eia (E.eq u e Ast.I) ]
+                       , E.mul [ E.Const Z.minus_one; pu ] )
+                     ; [ negative ], E.Const Z.zero
+                     ]))
+            | E.Pow (bt, E.Const k) when Z.(lt k zero) ->
+              let sgn = if Z.is_even k then Z.one else Z.minus_one in
+              loop
+                skipped
+                (splits_left - 1)
+                (case_split
+                   [ [ Ast.eia (E.eq bt (E.Const Z.zero) Ast.I) ], E.Const Z.zero
+                   ; [ Ast.eia (E.eq bt (E.Const Z.one) Ast.I) ], E.Const Z.one
+                   ; [ Ast.eia (E.eq bt (E.Const Z.minus_one) Ast.I) ], E.Const sgn
+                   ; ( [ Ast.lor_
+                           [ Ast.eia (E.leq (E.Const (Z.of_int 2)) bt)
+                           ; Ast.eia (E.leq bt (E.Const (Z.of_int (-2))))
+                           ]
+                       ]
+                     , E.Const Z.zero )
+                   ])
+            | p ->
+              (* A variable base under a nonnegative constant exponent: the
+                 fragment the under-approximation explores; unchanged. *)
+              skip ()))
+    in
+    loop Base.Set.Poly.empty ((pow_count * 4) + 8) ast)
+;;
+
+let run_basic_simplify ?(env = Env.empty) ?(minimize = true) ast =
   trace_log "Basic simplifications:\n%!";
   let ast = lower_mod ast in
   (* After [lower_mod]: the congruences it leaves alone are exactly the ones
@@ -3551,7 +3960,7 @@ let run_basic_simplify ?(env = Env.empty) ast =
   let __ _ = trace_log "After strlen lowering:@,@[%a@]\n" Ast.pp_smtlib2 ast in
   if Ast.is_conjunct ast
   then (
-    match basic_simplify [ 1 ] env ast with
+    match basic_simplify [ 1 ] ~minimize env ast with
     | `Sat env -> `Sat env
     | `Unsat core -> `Unsat core
     | `Unknown (ast, e, _, _) ->
@@ -3729,7 +4138,26 @@ let unfold_neq ast =
               match Map.find model v with
               | Some (`Str v) -> String.length v
               | Some (`Int v) -> assert false
+              | Some (`Bool _) -> assert false
               | None -> 0
+            in
+            let witness (a, b) =
+              let w =
+                Ast.land_
+                  [ Id_symantics.eq_str
+                      (Ast.Eia.atom (Ast.var lhs S))
+                      (Ast.Eia.str_const a)
+                  ; Id_symantics.eq_str
+                      (Ast.Eia.atom (Ast.var rhs S))
+                      (Ast.Eia.str_const b)
+                  ]
+              in
+              if String.equal a b
+              then None
+              else (
+                match check_sat (Ast.land_ [ orig_ast; w ]) with
+                | `Sat _ -> Some w
+                | `Unknown -> None)
             in
             let rec aux models =
               let ast =
@@ -3748,9 +4176,8 @@ let unfold_neq ast =
               | `Sat get_model ->
                 let model = get_model () in
                 let len = max (get_len model lhs) (get_len model rhs) in
-                begin match find_ineq_from_lengths len with
-                | Some (a, b) ->
-                  `Sat (fun () -> Map.of_alist_exn [ lhs, `Str a; rhs, `Str b ])
+                begin match Option.bind (find_ineq_from_lengths len) witness with
+                | Some w -> `Sat w
                 | None when List.length models > 10 -> `Unknown
                 | None ->
                   aux
@@ -3759,7 +4186,14 @@ let unfold_neq ast =
                 end
               | _ -> `Unknown
             in
-            aux []
+            let from_model =
+              match Map.find model lhs, Map.find model rhs with
+              | Some (`Str a), Some (`Str b) -> witness (a, b)
+              | _ -> None
+            in
+            match from_model with
+            | Some w -> `Sat w
+            | None -> aux []
           end
         in
         Ast.land_
@@ -3937,7 +4371,7 @@ let arithmetize str_vars ast env =
       include Id_symantics
 
       let str_concat xs =
-        let handle_concat (lhs : str) (rhs : str) =
+        let handle_concat (lhs : str) (rhs : str) rhs_len =
           let u = gensym () in
           let v = gensym () in
           let lhs' = gensym () in
@@ -3950,19 +4384,20 @@ let arithmetize str_vars ast env =
                [ Ast.Eia.mul [ Ast.Eia.Atom (Ast.var lhs' I); pow2var v ]
                ; Ast.Eia.atom (Ast.var rhs' I)
                ]);
-          extend v (Ast.Eia.len rhs);
+          extend v rhs_len;
           Ast.Eia.sofi (Ast.Eia.Atom (Ast.var u I))
         in
         let rec do_concat (xs : string Ast.Eia.term list) =
           match xs with
-          | [ Ast.Eia.Str_const s; _ ]
+          | Ast.Eia.Str_const s :: _
             when String.for_all Base.Char.is_digit s |> Stdlib.not ->
             raise (Unsupp_concat s)
           | [ _; Ast.Eia.Str_const s ]
             when String.for_all Base.Char.is_digit s |> Stdlib.not ->
             raise (Unsupp_concat s)
-          | [ lhs1; rhs1 ] -> handle_concat lhs1 rhs1
-          | hd :: tl -> handle_concat hd (do_concat tl)
+          | [ lhs1; rhs1 ] -> handle_concat lhs1 rhs1 (Ast.Eia.len rhs1)
+          | hd :: tl ->
+            handle_concat hd (do_concat tl) (Ast.Eia.add (List.map Ast.Eia.len tl))
           | [] -> Id_symantics.str_const ""
         in
         try do_concat xs with
@@ -4089,7 +4524,7 @@ let arithmetize str_vars ast env =
       else (
         trace_log "Arithmetizing regex ... for variable %s" s;
         let strlens = strlens s in
-        let csds =
+        let csds, _ =
           let is_eos vec =
             match Array.length vec with
             | 1 -> Char.equal (Array.get vec 0) Nfa.Str10.u_eos
@@ -4192,7 +4627,25 @@ let arithmetize str_vars ast env =
        | Unsupp _ -> false)
       |> fun res -> res
     in
-    arithmetize_concats var_info str_vars ast
+    let total_len = function
+      | Concat xs -> Ast.Eia.add (List.map Ast.Eia.len xs)
+      | s -> Ast.Eia.len s
+    in
+    let plain_part = function
+      | Atom (Var (_, S)) | Str_const _ -> true
+      | _ -> false
+    in
+    let plain = function
+      | Concat xs -> List.for_all plain_part xs
+      | s -> plain_part s
+    in
+    let with_lengths = function
+      | Ast.Eia (Eq (lhs, rhs, S)) as ast when plain lhs && plain rhs ->
+        Ast.land_ [ ast; Ast.eia (Ast.Eia.eq (total_len lhs) (total_len rhs) Ast.I) ]
+      | ast -> ast
+    in
+    Ast.map with_lengths ast
+    |> arithmetize_concats var_info str_vars
     |> apply_symantics_unsugared (module M)
     |> arithmetize_conj str_vars
     |> fun ast ->
