@@ -16,11 +16,11 @@ arithmetization sequence is lazy again and is no longer forced past the first
   > (get-model)
   > EOF
 
-  $ Chro --info slow.smt2
+  $ Chro slow.smt2
   sat (nfa)
   (
      (define-fun x () String
-      "1234582828282828282828282828282828282828282828282828282828282828282262626262626")
+      "12345828282262626262626")
   )
 
 The short-circuit itself — once one arithmetization answers `Sat` the rest of

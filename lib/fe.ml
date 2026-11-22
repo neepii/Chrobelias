@@ -139,10 +139,17 @@ and to_regex orig_expr =
     let rhs = to_regex rhs in
     Regex.mand lhs rhs
   | Expr.Unop (_ty, Ty.Unop.Regexp_loop (l, r), stmt) ->
+    (* ((_ re.loop l r) e) is e^l | ... | e^r: l copies of e followed by r - l optional
+       ones, and the empty language for r < l (SMT-LIB). Adding r optional copies, as
+       before, also accepted up to l + r copies. *)
     let stmt = to_regex stmt in
-    let lhs = List.init l (fun _ -> stmt) |> List.fold_left Regex.concat Regex.epsilon in
-    let rhs = List.init r (fun _ -> Regex.opt stmt) |> List.fold_left Regex.concat lhs in
-    rhs
+    if r < l
+    then Regex.empty
+    else (
+      let lhs =
+        List.init l (fun _ -> stmt) |> List.fold_left Regex.concat Regex.epsilon
+      in
+      List.init (r - l) (fun _ -> Regex.opt stmt) |> List.fold_left Regex.concat lhs)
   | Expr.Unop (_ty, Ty.Unop.Regexp_opt, expr) -> to_regex expr |> Regex.opt
   | Expr.Unop (_ty, Ty.Unop.Regexp_plus, expr) -> to_regex expr |> Regex.plus
   | Expr.Unop (_ty, Ty.Unop.Regexp_star, expr) -> to_regex expr |> Regex.kleene
@@ -174,10 +181,51 @@ and to_eia_term orig_expr : Z.t Ast.Eia.term * Ast.t =
   | Expr.App ({ name = Symbol.Simple "pow10"; _ }, [ expr ]) ->
     let* expr, phs = to_eia_term expr in
     return (Ast.Eia.pow Ast.Eia.(const (Z.of_int 10)) expr) phs
-  | Expr.App ({ name = Symbol.Simple "exp"; _ }, [ base; exp ]) ->
+  (* Exponentiation as standardized in SMT-LIB Ints (April 2026). "exp" is
+     the pre-standard spelling; kept as an alias while the vendored
+     benchmark corpora still use it (Chrobelias/Chrobelias#257).
+
+     Constant-constant powers with a negative exponent fold right here by
+     the standard's rules; everything else the engine's partial relation
+     does not cover is totalized by [SimplII.std_exp_split] before
+     solving. *)
+  | Expr.App ({ name = Symbol.Simple ("**" | "exp"); _ }, [ base; exp ]) ->
     let* base, phs = to_eia_term base in
     let* exp, phs' = to_eia_term exp in
-    return (Ast.Eia.pow base exp) (phs @ phs')
+    let rec const_of : Z.t Ast.Eia.term -> Z.t option = function
+      | Ast.Eia.Const c -> Some c
+      | Ast.Eia.Mul ts ->
+        List.fold_left
+          (fun acc t ->
+             match acc, const_of t with
+             | Some a, Some b -> Some (Z.mul a b)
+             | _ -> None)
+          (Some Z.one)
+          ts
+      | Ast.Eia.Add ts ->
+        List.fold_left
+          (fun acc t ->
+             match acc, const_of t with
+             | Some a, Some b -> Some (Z.add a b)
+             | _ -> None)
+          (Some Z.zero)
+          ts
+      | _ -> None
+    in
+    (* A constant negative exponent folds right here by the standard's
+       rules: [m ** n = div 1 (m ** -n)] for [n < 0], i.e. 0 whenever
+       [|m| > 1] or [m = 0], and [m ** -n] when [|m| = 1]. Nonnegative
+       constant exponents fold in the simplifier; every remaining shape
+       (negative or 0/1 bases over variable exponents, variable bases under
+       negative constant exponents) is totalized by [SimplII.std_exp_split]
+       before solving. *)
+      (match const_of base, const_of exp with
+       | Some m, Some k when Z.(lt k zero) ->
+         let v =
+           if Z.(equal (abs m) one) then if Z.is_even k then Z.one else m else Z.zero
+         in
+         return (Ast.Eia.const v) (phs @ phs')
+       | _ -> return (Ast.Eia.pow base exp) (phs @ phs'))
   (* Bit-wise operations *)
   | Expr.App ({ name = Symbol.Simple "bwand"; _ }, hd :: tl) ->
     List.fold_left
@@ -260,6 +308,22 @@ and to_ast tys orig_expr : Ast.t =
   (* Smtml Ty classification is kind of strange: it neither classifies the theory *)
   (* nor the return type. Let's introduce our own method for checking if the return *)
   (* type of the expr is string. *)
+  let rec is_bool tys expr =
+    match Expr.view expr with
+    | Expr.Symbol symbol ->
+      (match Base.Map.Poly.find tys (Symbol.to_string symbol) with
+       | Some `Bool -> true
+       | _ -> false)
+    | Expr.Val Smtml.Value.True | Expr.Val Smtml.Value.False -> true
+    | Expr.Relop _ -> true
+    | Expr.Triop (_, Ty.Triop.Ite, _, t, e) -> is_bool tys t || is_bool tys e
+    | Expr.Unop (_, Ty.Unop.Not, e) -> is_bool tys e
+    | Expr.Binop (_, (Ty.Binop.And | Ty.Binop.Or | Ty.Binop.Implies | Ty.Binop.Xor), l, r)
+      -> is_bool tys l || is_bool tys r
+    | Expr.Naryop (_, (Ty.Naryop.Logand | Ty.Naryop.Logor), es) ->
+      List.exists (is_bool tys) es
+    | _ -> false
+  in
   let rec is_str tys expr =
     match Expr.view expr with
     | Expr.Triop (_, Ty.Triop.Ite, _, t, e) -> is_str tys t || is_str tys e
@@ -365,6 +429,10 @@ and to_ast tys orig_expr : Ast.t =
       let lhs = to_ast tys lhs in
       let rhs = to_ast tys rhs in
       Ast.lor_ [ Ast.lnot lhs; rhs ]
+    | Expr.Binop (Ty.Ty_bool, Ty.Binop.Xor, lhs, rhs) ->
+      let lhs = to_ast tys lhs in
+      let rhs = to_ast tys rhs in
+      Ast.lor_ [ Ast.land_ [ lhs; Ast.lnot rhs ]; Ast.land_ [ Ast.lnot lhs; rhs ] ]
     (* Integer comparisons. *)
     | Expr.Relop (_ty, Ty.Relop.Eq, lhs, rhs) when is_str tys lhs || is_str tys rhs ->
       let build t c = Ast.eia (Ast.Eia.eq t c S) in
@@ -373,6 +441,14 @@ and to_ast tys orig_expr : Ast.t =
       extend phs;
       extend phs';
       build lhs rhs
+    | Expr.Relop (_ty, ((Ty.Relop.Eq | Ty.Relop.Ne) as rel), lhs, rhs)
+      when is_bool tys lhs || is_bool tys rhs ->
+      let lhs = to_ast tys lhs in
+      let rhs = to_ast tys rhs in
+      let iff =
+        Ast.land_ [ Ast.lor_ [ Ast.lnot lhs; rhs ]; Ast.lor_ [ lhs; Ast.lnot rhs ] ]
+      in
+      if rel = Ty.Relop.Eq then iff else Ast.lnot iff
     | Expr.Relop (_ty, rel, lhs, rhs) ->
       let build =
         match rel with

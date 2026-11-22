@@ -16,7 +16,7 @@ $ export OCAMLRUNPARAM='b=0'
   > (set-logic ALL)
   > (declare-fun x1 () Int)
   > (declare-fun x2 () Int)
-  > (assert (<= (exp x1 2) 124))
+  > (assert (<= (** x1 2) 124))
   > (check-sat)
   > EOF
   $ Chro -bound 0 --dsimpl TODO1.smt2 | sed 's/[[:space:]]*$//'
@@ -48,7 +48,7 @@ $ export OCAMLRUNPARAM='b=0'
   > (declare-fun z () Int)
   > (assert (and
   >        (<= (* z y) 0)
-  >        (<= (exp 2 x) (- 1))
+  >        (<= (** 2 x) (- 1))
   > ))
   > (check-sat)
   > EOF
@@ -60,29 +60,89 @@ $ export OCAMLRUNPARAM='b=0'
   [+simpl]
     iter(1)= (and
              (<= (* z y) 0)
-             (<= (+ 1 (exp 2 x)) 0))
+             (<= (+ 1 %stdexp2) 0)
+             (<= (* (- 1) x) 0)
+             (= (+ %stdexp1 (* (- 1) x)) 0)
+             (= (+ %stdexp2 (* (- 1) (** 2 %stdexp1))) 0))
   [+simpl]
     Alphabet with extra char: 0
   
   [+simpl]
+    Something ready to substitute
+        %stdexp1 -> x;
+        %stdexp2 -> (** 2 %stdexp1);
+        
+  [+simpl]
     iter(2)= (and
-             (<= (+ 1 (exp 2 x)) 0)
+             (= (+ %stdexp1 (* (- 1) x)) 0)
+             (= (+ %stdexp2 (* (- 1) (** 2 %stdexp1))) 0)
+             (<= (+ 1 %stdexp2) 0)
+             (<= (* (- 1) x) 0)
+             (<= (* y z) 0))
+  [+simpl]
+    iter(3)= (and
+             (= (+ (** 2 %stdexp1) (* (- 1) (** 2 x))) 0)
+             (<= (+ 1 (** 2 %stdexp1)) 0)
+             (<= (* (- 1) x) 0)
+             (<= (* y z) 0))
+  [+simpl]
+    iter(4)= (and
+             (<= (+ 1 (** 2 x)) 0)
+             (<= (* (- 1) x) 0)
              (<= (* y z) 0))
   [+simpl]
     fixed-point
   
   [+simpl]
-    Into Z3 goes: (bool.and (int.le_s (int.add 1 (int.pow 2 x)) 0)
-                 (int.le_s (int.mul y z) 0))
+    Basic simplifications:
   
-  unsat (nia)
+  [+simpl]
+    iter(1)= (and
+             (<= (* z y) 0)
+             (<= (+ 1 %stdexp2) 0)
+             (<= (* (- 1) x) 0)
+             (= (+ %stdexp1 (* (- 1) x)) 0)
+             (= (+ %stdexp2 (* (- 1) (** 2 %stdexp1))) 0))
+  [+simpl]
+    Alphabet with extra char: 0
+  
+  [+simpl]
+    Something ready to substitute
+        %stdexp1 -> x;
+        %stdexp2 -> (** 2 %stdexp1);
+        
+  [+simpl]
+    iter(2)= (and
+             (= (+ %stdexp1 (* (- 1) x)) 0)
+             (= (+ %stdexp2 (* (- 1) (** 2 %stdexp1))) 0)
+             (<= (+ 1 %stdexp2) 0)
+             (<= (* (- 1) x) 0)
+             (<= (* y z) 0))
+  [+simpl]
+    iter(3)= (and
+             (= (+ (** 2 %stdexp1) (* (- 1) (** 2 x))) 0)
+             (<= (+ 1 (** 2 %stdexp1)) 0)
+             (<= (* (- 1) x) 0)
+             (<= (* y z) 0))
+  [+simpl]
+    iter(4)= (and
+             (<= (+ 1 (** 2 x)) 0)
+             (<= (* (- 1) x) 0)
+             (<= (* y z) 0))
+  [+simpl]
+    fixed-point
+  
+  [+simpl]
+    Basic simplifications:
+  
+  unsat (over)
 The single exponent is not bad
   $ cat > TODO3.smt2 <<-EOF
   > (set-logic ALL)
   > (declare-fun it57 () Int)
   > (declare-fun it383 () Int)
   > (assert (and
-  >        (<= (+ (* (- 1) it383) (exp 2 it57)) 0)
+  >        (<= (+ (* (- 1) it383) (** 2 it57)) 0)
   >        (<= (* (- 1) it57) (- 1))
   > ))
   > (check-sat)
@@ -93,7 +153,7 @@ The single exponent is not bad
   
   [+simpl]
     iter(1)= (and
-             (<= (+ (* (- 1) it383) (exp 2 it57)) 0)
+             (<= (+ (* (- 1) it383) (** 2 it57)) 0)
              (<= (+ 1 (* (- 1) it57)) 0))
   [+simpl]
     Alphabet with extra char: 0
@@ -101,7 +161,7 @@ The single exponent is not bad
   [+simpl]
     iter(2)= (and
              (<= (+ 1 (* (- 1) it57)) 0)
-             (<= (+ (* (- 1) it383) (exp 2 it57)) 0))
+             (<= (+ (* (- 1) it383) (** 2 it57)) 0))
   [+simpl]
     fixed-point
   
